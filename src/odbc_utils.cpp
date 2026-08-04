@@ -102,7 +102,8 @@ string EscapeODBCConnectionValue(const string &value) {
 	if (value.empty()) {
 		return value;
 	}
-	if (value.find_first_of(";{}") == string::npos) {
+	bool has_outer_space = StringUtil::CharacterIsSpace(value.front()) || StringUtil::CharacterIsSpace(value.back());
+	if (!has_outer_space && value.find_first_of(";{}") == string::npos) {
 		return value;
 	}
 	string result = "{";
@@ -118,18 +119,6 @@ string EscapeODBCConnectionValue(const string &value) {
 }
 
 #ifndef _WIN32
-bool HasExtraParam(const vector<string> &extra_params, const string &name) {
-	auto lower_name = StringUtil::Lower(name);
-	for (auto &extra : extra_params) {
-		auto separator = extra.find('=');
-		auto key = separator == string::npos ? extra : extra.substr(0, separator);
-		if (StringUtil::Lower(key) == lower_name) {
-			return true;
-		}
-	}
-	return false;
-}
-
 void WriteODBCIniValue(std::ofstream &file, const string &key, const string &value) {
 	if (value.find_first_of("\r\n") != string::npos) {
 		throw InvalidInputException("Invalid ODBC connection value for \"%s\" - newlines are not supported", key);
@@ -164,6 +153,9 @@ string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &ds
 	if (!config.database.empty()) {
 		WriteODBCIniValue(file, "Database", config.database);
 	}
+	if (!config.dbq.empty()) {
+		WriteODBCIniValue(file, "DBQ", config.dbq);
+	}
 	for (auto &extra : config.extra_params) {
 		auto separator = extra.find('=');
 		if (separator == string::npos) {
@@ -171,13 +163,6 @@ string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &ds
 		}
 		WriteODBCIniValue(file, extra.substr(0, separator), extra.substr(separator + 1));
 	}
-	if (!HasExtraParam(config.extra_params, "ClientCharset")) {
-		WriteODBCIniValue(file, "ClientCharset", "UTF-8");
-	}
-	if (!HasExtraParam(config.extra_params, "TDS_Version")) {
-		WriteODBCIniValue(file, "TDS_Version", "8.0");
-	}
-
 	file.close();
 	if (!file.good()) {
 		std::remove(path.c_str());
@@ -225,18 +210,19 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 	while (pos < dsn.size()) {
 		string key;
 		string value;
-		
+
 		// Parse key
 		while (pos < dsn.size() && dsn[pos] != '=' && dsn[pos] != ';') {
 			key += dsn[pos];
 			pos++;
 		}
-		
+
 		if (pos >= dsn.size() || dsn[pos] != '=') {
-			throw InvalidInputException("Invalid connection string \"%s\" - expected key=value pairs separated by semicolons", dsn);
+			throw InvalidInputException(
+			    "Invalid connection string \"%s\" - expected key=value pairs separated by semicolons", dsn);
 		}
 		pos++; // skip '='
-		
+
 		// Parse value
 		if (pos < dsn.size() && dsn[pos] == '{') {
 			pos++; // skip '{'
@@ -259,7 +245,8 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 				throw InvalidInputException("Invalid connection string \"%s\" - unterminated braced value", dsn);
 			}
 			if (pos < dsn.size() && dsn[pos] != ';') {
-				throw InvalidInputException("Invalid connection string \"%s\" - expected semicolon after braced value", dsn);
+				throw InvalidInputException("Invalid connection string \"%s\" - expected semicolon after braced value",
+				                            dsn);
 			}
 		} else {
 			while (pos < dsn.size() && dsn[pos] != ';') {
@@ -267,11 +254,11 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 				pos++;
 			}
 		}
-		
+
 		if (pos < dsn.size() && dsn[pos] == ';') {
 			pos++; // skip ';'
 		}
-		
+
 		auto original_key = key;
 		key = StringUtil::Lower(key);
 
@@ -291,6 +278,9 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 		} else if (key == "database") {
 			set_options.insert("database");
 			result.database = value;
+		} else if (key == "dbq") {
+			set_options.insert("dbq");
+			result.dbq = value;
 		} else if (key == "uid") {
 			set_options.insert("uid");
 			result.uid = value;
@@ -301,12 +291,12 @@ std::tuple<ODBCConnectionParameters, unordered_set<string>> ODBCUtils::ParseConn
 			set_options.insert("port");
 			result.port = ParsePort(value);
 		} else {
-			// Preserve driver-specific parameters (like TDS_Version) verbatim
+			// Preserve driver-specific parameters verbatim.
 			result.extra_params.push_back(original_key + "=" + value);
 			continue;
 		}
 	}
-	
+
 	// For ODBC, connection parameters are specified in the connection string
 	return std::make_tuple(result, set_options);
 }
@@ -332,6 +322,9 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 	if (!config.database.empty()) {
 		connection_string += "DATABASE=" + EscapeODBCConnectionValue(config.database) + ";";
 	}
+	if (!config.dbq.empty()) {
+		connection_string += "DBQ=" + EscapeODBCConnectionValue(config.dbq) + ";";
+	}
 	if (config.port != 0) {
 		connection_string += "PORT=" + std::to_string(config.port) + ";";
 	}
@@ -343,17 +336,9 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 			connection_string += extra + ";";
 			continue;
 		}
-		connection_string += extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
+		connection_string +=
+		    extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
 	}
-
-#ifndef _WIN32
-	if (StringUtil::Lower(connection_string).find("clientcharset") == string::npos) {
-		connection_string += "ClientCharset=UTF-8;";
-	}
-	if (StringUtil::Lower(connection_string).find("tds_version") == string::npos) {
-		connection_string += "TDS_Version=8.0;";
-	}
-#endif
 
 	return connection_string;
 }
@@ -410,9 +395,10 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 		SQLFreeHandle(SQL_HANDLE_ENV, env);
 
-		throw IOException("Failed to connect to ODBC database with parameters \"%s\": %s", dsn.c_str(),
-		                  (char *)message_text);
+		throw IOException("Failed to connect to Oracle through ODBC: %s", (char *)message_text);
 	}
+	// This is a driver-level safeguard in addition to the read-only DuckDB catalog.
+	SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, (SQLPOINTER)SQL_MODE_READ_ONLY, 0);
 
 	out_env = env;
 	return dbc;
@@ -422,22 +408,7 @@ string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 	string result;
 	for (auto c : text) {
 		if (c == quote) {
-#ifdef _WIN32
-			// SQL Server on Windows: use double quotes (e.g., 'it''s')
 			result += string(2, quote);
-#else
-			// FreeTDS on Linux: use backslash escape (e.g., 'it\'s')
-			result += "\\";
-			result += quote;
-#endif
-		} else if (c == '\\') {
-#ifndef _WIN32
-			// Only escape backslash on Linux
-			result += "\\\\";
-#else
-			// On Windows, keep backslash as-is
-			result += c;
-#endif
 		} else {
 			result += c;
 		}
@@ -446,46 +417,86 @@ string ODBCUtils::EscapeQuotes(const string &text, char quote) {
 }
 
 string ODBCUtils::WriteQuoted(const string &text, char quote) {
-	// 1. Escapes all occurrences of 'quote' 
-	//    - Windows/SQL Server: by doubling them
-	//    - Linux/FreeTDS: by backslash escaping
-	// 2. Adds quotes around the string
 	return string(1, quote) + EscapeQuotes(text, quote) + string(1, quote);
 }
 
 string ODBCUtils::WriteIdentifier(const string &identifier) {
-	// For SQL Server ODBC, use square brackets for identifiers
-	// We need to handle square brackets specially since they are different from quotes
-	string result;
-	result += '[';
-	result += EscapeQuotes(identifier, ']'); // Escape any closing brackets in the identifier
-	result += ']';
-	return result;
+	return WriteQuoted(identifier, '"');
 }
 
 string ODBCUtils::WriteLiteral(const string &identifier) {
 	return ODBCUtils::WriteQuoted(identifier, '\'');
 }
 
-static string TransformBlobToODBC(const string &val) {
+OracleIdentifier ODBCUtils::ParseOracleIdentifier(const string &identifier) {
+	auto value = identifier;
+	StringUtil::Trim(value);
+	if (value.empty()) {
+		throw InvalidInputException("Oracle schema owner is empty");
+	}
+
+	auto starts_quoted = value.front() == '"';
+	auto ends_quoted = value.back() == '"';
+	if (starts_quoted || ends_quoted) {
+		if (!starts_quoted || !ends_quoted || value.size() < 2) {
+			throw InvalidInputException("Invalid quoted Oracle schema identifier \"%s\"", identifier);
+		}
+		string result;
+		for (idx_t i = 1; i + 1 < value.size(); i++) {
+			if (value[i] != '"') {
+				result += value[i];
+				continue;
+			}
+			if (i + 2 >= value.size() || value[i + 1] != '"') {
+				throw InvalidInputException("Invalid quoted Oracle schema identifier \"%s\"", identifier);
+			}
+			result += '"';
+			i++;
+		}
+		if (result.empty()) {
+			throw InvalidInputException("Oracle schema owner is empty");
+		}
+		OracleIdentifier parsed;
+		parsed.name = std::move(result);
+		parsed.quoted = true;
+		return parsed;
+	}
+	if (value.find('"') != string::npos) {
+		throw InvalidInputException("Invalid unquoted Oracle schema identifier \"%s\"", identifier);
+	}
+	OracleIdentifier parsed;
+	parsed.name = StringUtil::Upper(value);
+	return parsed;
+}
+
+static string TransformBlobToOracle(const string &val) {
 	char const HEX_DIGITS[] = "0123456789ABCDEF";
 
-	string result = "x'";
+	string result = "HEXTORAW('";
 	for (idx_t i = 0; i < val.size(); i++) {
 		uint8_t byte_val = static_cast<uint8_t>(val[i]);
 		result += HEX_DIGITS[(byte_val >> 4) & 0xf];
 		result += HEX_DIGITS[byte_val & 0xf];
 	}
-	result += "'";
+	result += "')";
 	return result;
 }
 
 string ODBCUtils::TransformConstant(const Value &val) {
-	if (val.type().IsNumeric() || val.type().id() == LogicalTypeId::BOOLEAN) {
+	if (val.type().IsNumeric()) {
 		return val.ToSQLString();
 	}
+	if (val.type().id() == LogicalTypeId::BOOLEAN) {
+		return BooleanValue::Get(val) ? "1" : "0";
+	}
 	if (val.type().id() == LogicalTypeId::BLOB) {
-		return TransformBlobToODBC(StringValue::Get(val));
+		return TransformBlobToOracle(StringValue::Get(val));
+	}
+	if (val.type().id() == LogicalTypeId::DATE) {
+		return "DATE " + WriteLiteral(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+	}
+	if (val.type().id() == LogicalTypeId::TIMESTAMP) {
+		return "TIMESTAMP " + WriteLiteral(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
 		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();

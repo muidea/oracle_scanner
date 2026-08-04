@@ -5,6 +5,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "storage/odbc_catalog.hpp"
+#include "storage/odbc_table_entry.hpp"
 
 namespace duckdb {
 
@@ -43,23 +44,29 @@ struct ODBCMetadataGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-static bool ODBCMetadataSchemaIsInternal(const string &name) {
+static bool ODBCMetadataSchemaIsInternal(const string &name, bool was_quoted) {
+	if (was_quoted) {
+		return false;
+	}
 	auto lower = StringUtil::Lower(name);
-	return lower == "information_schema" || lower == "performance_schema" || lower == "sys";
+	return lower == "sys" || lower == "system" || lower == "xdb" || lower == "sysaux";
 }
 
-static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindData &bind_data, SchemaCatalogEntry &schema) {
-	if (ODBCMetadataSchemaIsInternal(schema.name)) {
+static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindData &bind_data,
+                                     SchemaCatalogEntry &schema) {
+	auto &odbc_catalog = schema.ParentCatalog().Cast<ODBCCatalog>();
+	if (ODBCMetadataSchemaIsInternal(schema.name, odbc_catalog.DefaultSchemaWasQuoted())) {
 		return;
 	}
 	schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
 		auto &table = entry.Cast<TableCatalogEntry>();
+		auto &oracle_table = entry.Cast<ODBCTableEntry>();
 		int64_t ordinal = 1;
 		for (auto &column : table.GetColumns().Logical()) {
 			ODBCMetadataRow row;
 			row.table_schema = schema.name;
 			row.table_name = table.name;
-			row.table_type = "BASE TABLE";
+			row.table_type = oracle_table.IsView() ? "VIEW" : "BASE TABLE";
 			row.table_comment = "";
 			row.column_name = column.GetName();
 			row.data_type = column.GetType().ToString();
@@ -73,10 +80,10 @@ static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindDat
 static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	if (input.inputs[0].IsNull()) {
-		throw BinderException("Parameters to odbc_metadata cannot be NULL");
+		throw BinderException("Parameters to oracle_metadata cannot be NULL");
 	}
 
-	names = {"table_schema", "table_name", "table_type",      "table_comment",
+	names = {"table_schema", "table_name", "table_type",       "table_comment",
 	         "column_name",  "data_type",  "ordinal_position", "column_comment"};
 	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 	                LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR};
@@ -86,15 +93,18 @@ static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFu
 	if (input.inputs.size() > 1 && !input.inputs[1].IsNull()) {
 		schema_filter = input.inputs[1].GetValue<string>();
 		StringUtil::Trim(schema_filter);
+		if (!schema_filter.empty()) {
+			schema_filter = ODBCUtils::ParseOracleIdentifier(schema_filter).name;
+		}
 	}
 	auto &db_manager = DatabaseManager::Get(context);
 	auto db = db_manager.GetDatabase(context, db_name);
 	if (!db) {
-		throw BinderException("Failed to find attached database \"%s\" referenced in odbc_metadata", db_name);
+		throw BinderException("Failed to find attached database \"%s\" referenced in oracle_metadata", db_name);
 	}
 	auto &catalog = db->GetCatalog();
-	if (catalog.GetCatalogType() != "odbc") {
-		throw BinderException("Attached database \"%s\" does not refer to a ODBC database", db_name);
+	if (catalog.GetCatalogType() != "oracle") {
+		throw BinderException("Attached database \"%s\" does not refer to an Oracle database", db_name);
 	}
 
 	auto bind_data = make_uniq<ODBCMetadataBindData>();
@@ -103,9 +113,8 @@ static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFu
 		auto &schema = odbc_catalog.GetSchema(context, schema_filter);
 		ODBCMetadataAppendSchema(context, *bind_data, schema);
 	} else {
-		odbc_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
-			ODBCMetadataAppendSchema(context, *bind_data, schema);
-		});
+		odbc_catalog.ScanSchemas(
+		    context, [&](SchemaCatalogEntry &schema) { ODBCMetadataAppendSchema(context, *bind_data, schema); });
 	}
 	return std::move(bind_data);
 }
@@ -135,7 +144,7 @@ static void ODBCMetadataScan(ClientContext &context, TableFunctionInput &data, D
 }
 
 ODBCMetadataFunction::ODBCMetadataFunction()
-    : TableFunction("odbc_metadata", {LogicalType::VARCHAR}, ODBCMetadataScan, ODBCMetadataBind,
+    : TableFunction("oracle_metadata", {LogicalType::VARCHAR}, ODBCMetadataScan, ODBCMetadataBind,
                     ODBCMetadataInitGlobalState) {
 	varargs = LogicalType::VARCHAR;
 }

@@ -3,7 +3,7 @@
 
 #include "odbc_scanner.hpp"
 #include "odbc_storage.hpp"
-#include "odbc_scanner_extension.hpp"
+#include "oracle_scanner_extension.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -26,7 +26,7 @@ static void ForEachODBCCatalog(ClientContext &context, Fn &&fn) {
 	for (auto &db_ref : databases) {
 		auto &db = *db_ref;
 		auto &catalog = db.GetCatalog();
-		if (catalog.GetCatalogType() != "odbc") {
+		if (catalog.GetCatalogType() != "oracle") {
 			continue;
 		}
 		fn(catalog.Cast<ODBCCatalog>());
@@ -35,69 +35,60 @@ static void ForEachODBCCatalog(ClientContext &context, Fn &&fn) {
 
 static void SetODBCConnectionLimit(ClientContext &context, SetScope scope, Value &parameter) {
 	if (scope == SetScope::LOCAL) {
-		throw InvalidInputException("odbc_connection_limit can only be set globally");
+		throw InvalidInputException("oracle_connection_limit can only be set globally");
 	}
 	auto new_max = parameter.GetValue<uint64_t>();
-	ForEachODBCCatalog(context, [&](ODBCCatalog &catalog) { catalog.GetConnectionPool().SetMaximumConnections(new_max); });
+	ForEachODBCCatalog(context,
+	                   [&](ODBCCatalog &catalog) { catalog.GetConnectionPool().SetMaximumConnections(new_max); });
 	auto &config = DBConfig::GetConfig(context);
-	config.SetOption("odbc_connection_limit", parameter);
+	config.SetOption("oracle_connection_limit", parameter);
 }
 
 static void SetODBCConnectionCache(ClientContext &context, SetScope scope, Value &parameter) {
 	if (scope == SetScope::LOCAL) {
-		throw InvalidInputException("odbc_connection_cache can only be set globally");
+		throw InvalidInputException("oracle_connection_cache can only be set globally");
 	}
 	ODBCConnectionPool::ODBCSetConnectionCache(context, scope, parameter);
 	auto &config = DBConfig::GetConfig(context);
-	config.SetOption("odbc_connection_cache", parameter);
+	config.SetOption("oracle_connection_cache", parameter);
 }
 
-unique_ptr<BaseSecret> CreateODBCSecretFunction(ClientContext &, CreateSecretInput &input) {
+unique_ptr<BaseSecret> CreateOracleSecretFunction(ClientContext &, CreateSecretInput &input) {
 	// apply any overridden settings
 	vector<string> prefix_paths;
-	auto result = make_uniq<KeyValueSecret>(prefix_paths, "odbc", "config", input.name);
+	auto result = make_uniq<KeyValueSecret>(prefix_paths, "oracle", "config", input.name);
 	for (const auto &named_param : input.options) {
 		auto lower_name = StringUtil::Lower(named_param.first);
 
 		if (lower_name == "driver") {
 			result->secret_map["driver"] = named_param.second.ToString();
-		} else if (lower_name == "server") {
-			result->secret_map["server"] = named_param.second.ToString();
-		} else if (lower_name == "database") {
-			result->secret_map["database"] = named_param.second.ToString();
+		} else if (lower_name == "dbq") {
+			result->secret_map["dbq"] = named_param.second.ToString();
 		} else if (lower_name == "uid") {
 			result->secret_map["uid"] = named_param.second.ToString();
 		} else if (lower_name == "pwd") {
 			result->secret_map["pwd"] = named_param.second.ToString();
-		} else if (lower_name == "port") {
-			result->secret_map["port"] = named_param.second.ToString();
 		} else {
-			throw InternalException("Unknown named parameter passed to CreateODBCSecretFunction: " + lower_name);
+			throw InternalException("Unknown named parameter passed to CreateOracleSecretFunction: " + lower_name);
 		}
 	}
 
 	//! Set redact keys
-	result->redact_keys = {"password"};
+	result->redact_keys = {"pwd", "password"};
 	return std::move(result);
 }
 
-void SetODBCSecretParameters(CreateSecretFunction &function) {
+void SetOracleSecretParameters(CreateSecretFunction &function) {
 	function.named_parameters["driver"] = LogicalType::VARCHAR;
-	function.named_parameters["server"] = LogicalType::VARCHAR;
-	function.named_parameters["port"] = LogicalType::VARCHAR;
+	function.named_parameters["dbq"] = LogicalType::VARCHAR;
 	function.named_parameters["uid"] = LogicalType::VARCHAR;
 	function.named_parameters["pwd"] = LogicalType::VARCHAR;
-	function.named_parameters["database"] = LogicalType::VARCHAR;
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	// ODBC doesn't require explicit library initialization like MySQL
-	// The ODBC driver manager handles initialization automatically
+	// The ODBC driver manager handles Oracle driver initialization.
 	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
-
-	ODBCExecuteFunction execute_function;
-	loader.RegisterFunction(execute_function);
 
 	ODBCQueryFunction query_function;
 	loader.RegisterFunction(query_function);
@@ -106,41 +97,36 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(metadata_function);
 
 	SecretType secret_type;
-	secret_type.name = "odbc";
+	secret_type.name = "oracle";
 	secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
 	secret_type.default_provider = "config";
 
 	loader.RegisterSecretType(secret_type);
 
-	CreateSecretFunction odbc_secret_function = {"odbc", "config", CreateODBCSecretFunction};
-	SetODBCSecretParameters(odbc_secret_function);
-	loader.RegisterFunction(odbc_secret_function);
+	CreateSecretFunction oracle_secret_function = {"oracle", "config", CreateOracleSecretFunction};
+	SetOracleSecretParameters(oracle_secret_function);
+	loader.RegisterFunction(oracle_secret_function);
 
 	auto &db = loader.GetDatabaseInstance();
 
 	auto &config = DBConfig::GetConfig(db);
-	StorageExtension::Register(config, "odbc_scanner", make_shared_ptr<ODBCStorageExtension>());
+	StorageExtension::Register(config, "oracle_scanner", make_shared_ptr<ODBCStorageExtension>());
 
-	config.AddExtensionOption("odbc_experimental_filter_pushdown",
+	config.AddExtensionOption("oracle_experimental_filter_pushdown",
 	                          "Whether or not to use filter pushdown (currently experimental)", LogicalType::BOOLEAN,
 	                          Value::BOOLEAN(true));
-	config.AddExtensionOption("odbc_debug_show_queries", "DEBUG SETTING: print all queries sent to ODBC to stdout",
+	config.AddExtensionOption("oracle_debug_show_queries", "DEBUG SETTING: print all queries sent to Oracle to stdout",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetODBCDebugQueryPrint);
-	config.AddExtensionOption("odbc_tinyint1_as_boolean", "Whether or not to convert TINYINT(1) columns to BOOLEAN",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
-	config.AddExtensionOption("odbc_bit1_as_boolean", "Whether or not to convert BIT(1) columns to BOOLEAN",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), ODBCClearCacheFunction::ClearCacheOnSetting);
-	config.AddExtensionOption("odbc_session_time_zone",
+	config.AddExtensionOption("oracle_session_time_zone",
 	                          "Value to use as a session time zone for newly opened"
 	                          " connections to ODBC server",
 	                          LogicalType::VARCHAR, Value(""), ODBCClearCacheFunction::ClearCacheOnSetting);
-	config.AddExtensionOption("odbc_time_as_time", "Whether or not to convert ODBC's TIME columns to DuckDB's TIME",
-	                          LogicalType::BOOLEAN, Value::BOOLEAN(false),
-	                          ODBCClearCacheFunction::ClearCacheOnSetting);
-	config.AddExtensionOption("odbc_connection_limit", "Maximum number of connections per ODBC catalog",
+	config.AddExtensionOption("oracle_time_as_time", "Whether or not to convert ODBC TIME columns to DuckDB TIME",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), ODBCClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption("oracle_connection_limit", "Maximum number of connections per Oracle catalog",
 	                          LogicalType::UBIGINT, Value::UBIGINT(ODBCConnectionPool::DEFAULT_MAX_CONNECTIONS),
 	                          SetODBCConnectionLimit);
-	config.AddExtensionOption("odbc_connection_cache", "Whether or not to cache idle ODBC connections",
+	config.AddExtensionOption("oracle_connection_cache", "Whether or not to cache idle Oracle connections",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true), SetODBCConnectionCache);
 
 	OptimizerExtension odbc_optimizer;
@@ -148,13 +134,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension::Register(config, std::move(odbc_optimizer));
 }
 
-void ODBCScannerExtension::Load(ExtensionLoader &loader) {
+void OracleScannerExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);
 }
 
 extern "C" {
 
-DUCKDB_CPP_EXTENSION_ENTRY(odbc_scanner, loader) {
+DUCKDB_CPP_EXTENSION_ENTRY(oracle_scanner, loader) {
 	LoadInternal(loader);
 }
 }

@@ -16,16 +16,27 @@
 namespace duckdb {
 
 ODBCCatalog::ODBCCatalog(AttachedDatabase &db_p, string connection_string_p, string attach_path_p,
-                           AccessMode access_mode)
+                         string default_schema_p, AccessMode access_mode)
     : Catalog(db_p), connection_string(std::move(connection_string_p)), attach_path(std::move(attach_path_p)),
-      access_mode(access_mode), schemas(*this), connection_pool(*this) {
+      access_mode(access_mode), schemas(*this), default_schema(std::move(default_schema_p)), connection_pool(*this) {
 	ODBCConnectionParameters connection_params;
 	unordered_set<string> unused_params;
 	std::tie(connection_params, unused_params) = ODBCUtils::ParseConnectionParameters(connection_string);
-	default_schema = connection_params.database;
+	StringUtil::Trim(default_schema);
+	if (default_schema.empty()) {
+		if (!connection_params.uid.empty()) {
+			auto identifier = ODBCUtils::ParseOracleIdentifier(connection_params.uid);
+			default_schema = std::move(identifier.name);
+			default_schema_was_quoted = identifier.quoted;
+		}
+	} else {
+		auto identifier = ODBCUtils::ParseOracleIdentifier(default_schema);
+		default_schema = std::move(identifier.name);
+		default_schema_was_quoted = identifier.quoted;
+	}
 	Value connection_limit;
 	auto &db_instance = db_p.GetDatabase();
-	if (db_instance.TryGetCurrentSetting("odbc_connection_limit", connection_limit)) {
+	if (db_instance.TryGetCurrentSetting("oracle_connection_limit", connection_limit)) {
 		connection_pool.SetMaximumConnections(UBigIntValue::Get(connection_limit));
 	}
 	// try to connect
@@ -62,11 +73,11 @@ string AddConnectionOption(const KeyValueSecret &kv_secret, const string &name,
 		// not provided
 		return string();
 	}
-	string result;
-	result += name;
-	result += "=";
-	result += EscapeConnectionString(input_val.ToString());
-	result += " ";
+	string result = name + "={";
+	for (auto ch : input_val.ToString()) {
+		result += ch == '}' ? "}}" : string(1, ch);
+	}
+	result += "};";
 	return result;
 }
 
@@ -374,7 +385,7 @@ string ODBCCatalog::GetConnectionString(ClientContext &context, const string &at
 	if (!explicit_secret) {
 		// look up settings from the default unnamed odbc secret if none is
 		// provided
-		secret_name = "__default_odbc";
+		secret_name = "__default_oracle";
 	}
 
 	auto secret_entry = GetSecret(context, secret_name);
@@ -400,16 +411,14 @@ string ODBCCatalog::GetConnectionString(ClientContext &context, const string &at
 
 		new_connection_info += AddConnectionOption(kv_secret, "uid", existing_params);
 		new_connection_info += AddConnectionOption(kv_secret, "pwd", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "server", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "port", existing_params);
-		new_connection_info += AddConnectionOption(kv_secret, "database", existing_params);
+		new_connection_info += AddConnectionOption(kv_secret, "dbq", existing_params);
 		new_connection_info += AddConnectionOption(kv_secret, "driver", existing_params);
 
 		// Combine the parameters, putting secret parameters first
 		if (!new_connection_info.empty()) {
 			if (!connection_string.empty()) {
 				// Only add a space if both parts are non-empty
-				connection_string = new_connection_info + " " + connection_string;
+				connection_string = new_connection_info + connection_string;
 			} else {
 				connection_string = new_connection_info;
 			}
@@ -437,7 +446,7 @@ optional_ptr<CatalogEntry> ODBCCatalog::CreateSchema(CatalogTransaction transact
 }
 
 void ODBCCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	return schemas.DropEntry(context, info);
+	throw PermissionException("oracle_scanner catalogs are read-only");
 }
 
 void ODBCCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
@@ -445,8 +454,8 @@ void ODBCCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaC
 }
 
 optional_ptr<SchemaCatalogEntry> ODBCCatalog::LookupSchema(CatalogTransaction transaction,
-                                                            const EntryLookupInfo &schema_lookup,
-                                                            OnEntryNotFound if_not_found) {
+                                                           const EntryLookupInfo &schema_lookup,
+                                                           OnEntryNotFound if_not_found) {
 	auto schema_name = schema_lookup.GetEntryName();
 	if (schema_name == DEFAULT_SCHEMA) {
 		if (default_schema.empty()) {
@@ -471,11 +480,11 @@ string ODBCCatalog::GetDBPath() {
 }
 
 bool ODBCCatalog::IsODBCScan(const string &name) {
-	return name == "odbc_scan";
+	return name == "oracle_scan";
 }
 
 bool ODBCCatalog::IsODBCQuery(const string &name) {
-	return name == "odbc_query";
+	return name == "oracle_query";
 }
 
 void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
@@ -496,33 +505,43 @@ void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
 }
 
 DatabaseSize ODBCCatalog::GetDatabaseSize(ClientContext &context) {
-	if (default_schema.empty()) {
-		throw InvalidInputException("Attempting to fetch the database size - but no database was provided "
-		                            "in the connection string");
-	}
-	auto &postgres_transaction = ODBCTransaction::Get(context, *this);
-	auto query = StringUtil::Replace(R"(
-SELECT SUM(data_length + index_length)
-FROM information_schema.tables
-WHERE table_schema = ${SCHEMA_NAME};
-)",
-	                                 "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(default_schema));
-	auto result = postgres_transaction.Query(query);
 	DatabaseSize size;
 	size.free_blocks = 0;
 	size.total_blocks = 0;
 	size.used_blocks = 0;
 	size.wal_size = 0;
 	size.block_size = 0;
-	if (!result->Next()) {
-		throw InternalException("ODBCCatalog::GetDatabaseSize - No row returned!?");
-	}
-	size.bytes = result->IsNull(0) ? 0 : result->GetInt64(0);
+	size.bytes = 0;
 	return size;
 }
 
 void ODBCCatalog::ClearCache() {
 	schemas.ClearEntries();
+}
+
+PhysicalOperator &ODBCCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                 LogicalCreateTable &op, PhysicalOperator &plan) {
+	throw PermissionException("oracle_scanner catalogs are read-only");
+}
+
+PhysicalOperator &ODBCCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
+                                          optional_ptr<PhysicalOperator> plan) {
+	throw PermissionException("oracle_scanner catalogs are read-only");
+}
+
+PhysicalOperator &ODBCCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
+                                          PhysicalOperator &plan) {
+	throw PermissionException("oracle_scanner catalogs are read-only");
+}
+
+PhysicalOperator &ODBCCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
+                                          PhysicalOperator &plan) {
+	throw PermissionException("oracle_scanner catalogs are read-only");
+}
+
+unique_ptr<LogicalOperator> ODBCCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,
+                                                         TableCatalogEntry &table, unique_ptr<LogicalOperator> plan) {
+	throw PermissionException("oracle_scanner catalogs are read-only");
 }
 
 } // namespace duckdb

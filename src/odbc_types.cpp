@@ -1,4 +1,5 @@
 #include "odbc_types.hpp"
+#include <algorithm>
 #include <cstdio>
 
 namespace duckdb {
@@ -15,86 +16,81 @@ ODBCTypeConfig::ODBCTypeConfig() {
 }
 
 ODBCTypeConfig::ODBCTypeConfig(ClientContext &context)
-    : bit1_as_boolean(GetBoolOption(context, "odbc_bit1_as_boolean")),
-      tinyint1_as_boolean(GetBoolOption(context, "odbc_tinyint1_as_boolean")),
-      time_as_time(GetBoolOption(context, "odbc_time_as_time")) {
+    : bit1_as_boolean(false), tinyint1_as_boolean(false), time_as_time(GetBoolOption(context, "oracle_time_as_time")) {
 }
 
 LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, const ODBCTypeData &type_info) {
-	
-	if (type_info.type_name == "tinyint") {
-		if (type_info.column_type == "tinyint(1)" && type_config.tinyint1_as_boolean) {
-			return LogicalType::BOOLEAN;
-		}
-		if (StringUtil::Contains(type_info.column_type, "unsigned")) {
-			return LogicalType::UTINYINT;
-		}
-		// SQL Server tinyint is unsigned (0..255).
-		// When sign information is absent in metadata, prefer UTINYINT to avoid overflow.
-		return LogicalType::UTINYINT;
-	} else if (type_info.type_name == "smallint") {
-		if (StringUtil::Contains(type_info.column_type, "unsigned")) {
-			return LogicalType::USMALLINT;
-		} else {
-			return LogicalType::SMALLINT;
-		}
-	} else if (type_info.type_name == "int") {
-		if (StringUtil::Contains(type_info.column_type, "unsigned")) {
-			return LogicalType::UINTEGER;
-		} else {
-			return LogicalType::INTEGER;
-		}
-	} else if (type_info.type_name == "bigint") {
-		if (StringUtil::Contains(type_info.column_type, "unsigned")) {
-			return LogicalType::UBIGINT;
-		} else {
-			return LogicalType::BIGINT;
-		}
-	} else if (type_info.type_name == "real") {
-		return LogicalType::FLOAT;
-	} else if (type_info.type_name == "float") {
-		return LogicalType::FLOAT;
-	} else if (type_info.type_name == "double") {
-		return LogicalType::DOUBLE;
-	} else if (type_info.type_name == "date") {
-		return LogicalType::DATE;
-	} else if (type_info.type_name == "time") {
-		// we convert time to VARCHAR by default because TIME in ODBC is more like an
-		// interval and can store ranges between -838:00:00 to 838:00:00
-		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
-	} else if (type_info.type_name == "timestamp") {
-		// in ODBC, "timestamp" columns are timezone aware while "datetime" columns
-		// are not
-		return LogicalType::TIMESTAMP_TZ;
-	} else if (type_info.type_name == "datetime") {
-		return LogicalType::TIMESTAMP;
-	} else if (type_info.type_name == "decimal") {
-		if (type_info.precision > 0 && type_info.precision <= 38) {
-			return LogicalType::DECIMAL(type_info.precision, type_info.scale);
-		}
-		return LogicalType::DOUBLE;
-	} else if (type_info.type_name == "bit") {
-		if (type_info.column_type == "bit(1)" && type_config.bit1_as_boolean) {
-			return LogicalType::BOOLEAN;
-		}
-		return LogicalType::BLOB;
-	} else if (type_info.type_name == "varbinary" || type_info.type_name == "binary" ||
-	           type_info.type_name == "blob" || type_info.type_name == "longvarbinary") {
-		return LogicalType::BLOB;
-	} else if (type_info.type_name == "nvarchar" || type_info.type_name == "nchar" ||
-	           type_info.type_name == "uniqueidentifier" || type_info.type_name == "interval") {
-		return LogicalType::VARCHAR;
-	} else if (type_info.type_name == "varchar" || type_info.type_name == "char" ||
-	           type_info.type_name == "text" || type_info.type_name == "longvarchar") {
+	auto type_name = StringUtil::Lower(type_info.type_name);
+	StringUtil::Trim(type_name);
+
+	if (StringUtil::Contains(type_name, "timestamp with time zone")) {
 		return LogicalType::VARCHAR;
 	}
-	// fallback for unknown types
+	if (StringUtil::Contains(type_name, "timestamp")) {
+		return LogicalType::TIMESTAMP;
+	}
+	if (type_name == "date") {
+		// Oracle DATE includes hours, minutes and seconds.
+		return LogicalType::TIMESTAMP;
+	}
+	if (type_name == "number" || type_name == "numeric" || type_name == "decimal" || type_name == "integer") {
+		if (type_info.precision > 0 && type_info.precision <= 38 && type_info.scale >= 0 && type_info.scale <= 38) {
+			auto width = NumericCast<uint8_t>(std::max(type_info.precision, type_info.scale));
+			return LogicalType::DECIMAL(width, NumericCast<uint8_t>(type_info.scale));
+		}
+		return LogicalType::DOUBLE;
+	}
+	if (type_name == "binary_float" || type_name == "real") {
+		return LogicalType::FLOAT;
+	}
+	if (type_name == "binary_double" || type_name == "float" || type_name == "double" ||
+	    type_name == "double precision") {
+		return LogicalType::DOUBLE;
+	}
+	if (type_name == "smallint") {
+		return LogicalType::SMALLINT;
+	}
+	if (type_name == "int") {
+		return LogicalType::INTEGER;
+	}
+	if (type_name == "bigint") {
+		return LogicalType::BIGINT;
+	}
+	if (type_name == "tinyint") {
+		return LogicalType::TINYINT;
+	}
+	if (type_name == "boolean" || type_name == "bit") {
+		return LogicalType::BOOLEAN;
+	}
+	if (type_name == "time") {
+		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
+	}
+	if (type_name == "raw" || type_name == "long raw" || type_name == "blob" || type_name == "binary" ||
+	    type_name == "varbinary" || type_name == "longvarbinary") {
+		return LogicalType::BLOB;
+	}
+	if (type_name == "char" || type_name == "nchar" || type_name == "varchar" || type_name == "varchar2" ||
+	    type_name == "nvarchar" || type_name == "nvarchar2" || type_name == "long" || type_name == "text" ||
+	    type_name == "longvarchar" || type_name == "clob" || type_name == "nclob" || type_name == "rowid" ||
+	    type_name == "urowid" || type_name == "xmltype" || type_name == "json" ||
+	    StringUtil::Contains(type_name, "interval")) {
+		return LogicalType::VARCHAR;
+	}
 	return LogicalType::VARCHAR;
 }
 
-LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQLSMALLINT data_type, SQLULEN col_size, SQLSMALLINT decimal_digits) {
+LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQLSMALLINT data_type, SQLULEN col_size,
+                                          SQLSMALLINT decimal_digits, const string &reported_type_name) {
 	ODBCTypeData type_data;
-	
+	type_data.type_name = StringUtil::Lower(reported_type_name);
+	type_data.precision = col_size > 0 ? NumericCast<int64_t>(col_size) : -1;
+	type_data.scale = decimal_digits;
+
+	if (!type_data.type_name.empty()) {
+		type_data.column_type = type_data.type_name;
+		return TypeToLogicalType(type_config, type_data);
+	}
+
 	switch (data_type) {
 	case SQL_CHAR:
 	case SQL_VARCHAR:
@@ -108,9 +104,7 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 		break;
 	case SQL_DECIMAL:
 	case SQL_NUMERIC:
-		type_data.type_name = "decimal";
-		type_data.precision = (col_size > 0) ? static_cast<int64_t>(col_size) : 10;
-		type_data.scale = (decimal_digits > 0) ? static_cast<int64_t>(decimal_digits) : 0;
+		type_data.type_name = "number";
 		break;
 	case SQL_SMALLINT:
 		type_data.type_name = "smallint";
@@ -140,20 +134,14 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 		type_data.type_name = "varbinary";
 		break;
 	case SQL_DATE:
-		type_data.type_name = "date";
-		break;
-	case SQL_TIME:
-		type_data.type_name = "time";
-		break;
-	case SQL_TIMESTAMP:
-		type_data.type_name = "timestamp";
-		break;
 	case SQL_TYPE_DATE:
 		type_data.type_name = "date";
 		break;
+	case SQL_TIME:
 	case SQL_TYPE_TIME:
 		type_data.type_name = "time";
 		break;
+	case SQL_TIMESTAMP:
 	case SQL_TYPE_TIMESTAMP:
 		type_data.type_name = "timestamp";
 		break;
@@ -179,102 +167,13 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 		type_data.type_name = "varchar";
 		break;
 	}
-	
+
 	type_data.column_type = type_data.type_name;
-	LogicalType result = ODBCTypes::TypeToLogicalType(type_config, type_data);
-	
-	if (result.id() == LogicalTypeId::VARCHAR) {
-		// Check if this should have been an integer type
-		switch (data_type) {
-		case SQL_TINYINT:
-			return LogicalType::UTINYINT;
-		case SQL_SMALLINT:
-			return LogicalType::SMALLINT;
-		case SQL_INTEGER:
-			return LogicalType::INTEGER;
-		case SQL_BIGINT:
-			return LogicalType::BIGINT;
-		case SQL_REAL:
-			return LogicalType::FLOAT;
-		case SQL_FLOAT:
-		case SQL_DOUBLE:
-			return LogicalType::DOUBLE;
-		case SQL_DECIMAL:
-		case SQL_NUMERIC:
-			// For decimal/numeric, check if we have precision info
-			if (col_size > 0 && col_size <= 38) {
-				return LogicalType::DECIMAL(col_size, decimal_digits);
-			}
-			return LogicalType::DOUBLE;
-		}
-	}
-	
-	return result;
-}
-
-LogicalType ODBCTypes::ToODBCType(const ODBCTypeConfig &type_config, const LogicalType &input) {
-	switch (input.id()) {
-	case LogicalTypeId::BOOLEAN:
-	case LogicalTypeId::SMALLINT:
-	case LogicalTypeId::INTEGER:
-	case LogicalTypeId::BIGINT:
-	case LogicalTypeId::TINYINT:
-	case LogicalTypeId::UTINYINT:
-	case LogicalTypeId::USMALLINT:
-	case LogicalTypeId::UINTEGER:
-	case LogicalTypeId::UBIGINT:
-	case LogicalTypeId::FLOAT:
-	case LogicalTypeId::DOUBLE:
-	case LogicalTypeId::BLOB:
-	case LogicalTypeId::DATE:
-	case LogicalTypeId::DECIMAL:
-	case LogicalTypeId::TIMESTAMP:
-	case LogicalTypeId::TIMESTAMP_TZ:
-	case LogicalTypeId::VARCHAR:
-		return input;
-	case LogicalTypeId::TIME:
-		return type_config.time_as_time ? LogicalType::TIME : LogicalType::VARCHAR;
-	case LogicalTypeId::LIST:
-		throw NotImplementedException("ODBC does not support arrays - unsupported type \"%s\"", input.ToString());
-	case LogicalTypeId::STRUCT:
-	case LogicalTypeId::MAP:
-	case LogicalTypeId::UNION:
-		throw NotImplementedException("ODBC does not support composite types - unsupported type \"%s\"",
-		                              input.ToString());
-	case LogicalTypeId::TIMESTAMP_SEC:
-	case LogicalTypeId::TIMESTAMP_MS:
-	case LogicalTypeId::TIMESTAMP_NS:
-		return LogicalType::TIMESTAMP;
-	case LogicalTypeId::HUGEINT:
-		return LogicalType::DOUBLE;
-	default:
-		return LogicalType::VARCHAR;
-	}
-}
-
-string ODBCTypes::TypeToString(const LogicalType &input) {
-	switch (input.id()) {
-	case LogicalType::VARCHAR:
-		return "TEXT";
-	case LogicalType::UTINYINT:
-		return "TINYINT UNSIGNED";
-	case LogicalType::USMALLINT:
-		return "SMALLINT UNSIGNED";
-	case LogicalType::UINTEGER:
-		return "INTEGER UNSIGNED";
-	case LogicalType::UBIGINT:
-		return "BIGINT UNSIGNED";
-	case LogicalType::TIMESTAMP:
-		return "DATETIME";
-	case LogicalType::TIMESTAMP_TZ:
-		return "TIMESTAMP";
-	default:
-		return input.ToString();
-	}
+	return ODBCTypes::TypeToLogicalType(type_config, type_data);
 }
 
 SQLSMALLINT ODBCTypes::GetCType(SQLSMALLINT sql_type) {
-	
+
 	switch (sql_type) {
 	case SQL_CHAR:
 	case SQL_VARCHAR:
@@ -321,8 +220,9 @@ SQLSMALLINT ODBCTypes::GetCType(SQLSMALLINT sql_type) {
 	}
 }
 
-LogicalType ODBCTypes::ODBCToLogicalType(const ODBCTypeConfig &type_config, SQLSMALLINT data_type, SQLULEN column_size, SQLSMALLINT decimal_digits) {
-	return ODBCTypes::FieldToLogicalType(type_config, data_type, column_size, decimal_digits);
+LogicalType ODBCTypes::ODBCToLogicalType(const ODBCTypeConfig &type_config, SQLSMALLINT data_type, SQLULEN column_size,
+                                         SQLSMALLINT decimal_digits, const string &type_name) {
+	return ODBCTypes::FieldToLogicalType(type_config, data_type, column_size, decimal_digits, type_name);
 }
 
 } // namespace duckdb

@@ -63,12 +63,14 @@ void OptimizeODBCScan(unique_ptr<LogicalOperator> &op) {
 			return;
 		}
 		if (limit.offset_val.Type() != LimitNodeType::UNSET) {
-			// SQL Server doesn't support OFFSET; let DuckDB handle it
+			// Keep OFFSET local until the supported Oracle version is known.
 			return;
 		}
 		if (limit.limit_val.Type() != LimitNodeType::UNSET) {
 			auto &bind_data = get.bind_data->Cast<ODBCBindData>();
-			bind_data.limit = " TOP " + to_string(limit.limit_val.GetConstantValue());
+			// ROWNUM is supported by Oracle 11g and newer, whereas FETCH FIRST
+			// requires Oracle 12c or newer.
+			bind_data.limit = to_string(limit.limit_val.GetConstantValue());
 		}
 		// remove the limit
 		op = std::move(op->children[0]);

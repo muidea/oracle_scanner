@@ -11,23 +11,21 @@
 namespace duckdb {
 
 ODBCTransaction::ODBCTransaction(ODBCCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context)
-    : Transaction(manager, context),
-      odbc_catalog(odbc_catalog),
-      access_mode(odbc_catalog.access_mode) {
+    : Transaction(manager, context), odbc_catalog(odbc_catalog), access_mode(odbc_catalog.access_mode) {
 	// 从连接池获取连接
 	if (!odbc_catalog.GetConnectionPool().TryGetConnection(pool_connection)) {
 		throw IOException("Failed to get connection from ODBC connection pool");
 	}
-	
+
 	string time_zone;
 	{
 		Value odbc_session_time_zone;
-		if (context.TryGetCurrentSetting("odbc_session_time_zone", odbc_session_time_zone)) {
+		if (context.TryGetCurrentSetting("oracle_session_time_zone", odbc_session_time_zone)) {
 			time_zone = odbc_session_time_zone.ToString();
 		}
 	}
 	if (!time_zone.empty()) {
-		pool_connection.GetConnection()->Execute("SET TIME_ZONE = '" + time_zone + "'");
+		pool_connection.GetConnection()->Execute("ALTER SESSION SET TIME_ZONE = " + ODBCUtils::WriteLiteral(time_zone));
 	}
 }
 
@@ -53,31 +51,31 @@ void ODBCTransaction::Rollback() {
 
 ODBCConnection &ODBCTransaction::GetConnection() {
 	// For ODBC connections, we rely on the driver's default transaction management
-	// Many ODBC drivers (including SQL Server) handle transactions automatically
+	// Oracle reads use the driver's default transaction handling.
 	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
-	
+
 	if (!pool_connection.HasConnection()) {
 		throw InternalException("ODBCTransaction::GetConnection called but pool connection is not valid");
 	}
-	
+
 	return *pool_connection.GetConnection();
 }
 
 shared_ptr<ODBCConnection> ODBCTransaction::GetConnectionShared() {
 	// For ODBC connections, we rely on the driver's default transaction management
-	// Many ODBC drivers (including SQL Server) handle transactions automatically
+	// Oracle reads use the driver's default transaction handling.
 	if (transaction_state == ODBCTransactionState::TRANSACTION_NOT_YET_STARTED) {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
-	
+
 	if (!pool_connection.HasConnection()) {
 		throw InternalException("ODBCTransaction::GetConnectionShared called but pool connection is not valid");
 	}
-	
+
 	return pool_connection.GetConnection();
 }
 
@@ -87,11 +85,11 @@ unique_ptr<ODBCResult> ODBCTransaction::Query(const string &query) {
 		transaction_state = ODBCTransactionState::TRANSACTION_STARTED;
 		// Don't explicitly start a transaction - let the ODBC driver handle it
 	}
-	
+
 	if (!pool_connection.HasConnection()) {
 		throw InternalException("ODBCTransaction::Query called but pool connection is not valid");
 	}
-	
+
 	return pool_connection.GetConnection()->Query(query, ODBCResultStreaming::FORCE_MATERIALIZATION);
 }
 

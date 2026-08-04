@@ -1,10 +1,10 @@
-# AGENTS.md - Development Guide for odbc-scanner
+# AGENTS.md - Development Guide for oracle_scanner
 
-This document provides guidance for AI agents working on the odbc-scanner DuckDB extension.
+This document provides guidance for AI agents working on the oracle_scanner DuckDB extension.
 
 ## Project Overview
 
-odbc-scanner is a DuckDB extension that provides ODBC connectivity, allowing DuckDB to query external databases via ODBC drivers. It implements table functions (`odbc_scan`, `odbc_query`) that connect to ODBC data sources.
+oracle_scanner is a read-only DuckDB storage extension that queries Oracle through an Oracle ODBC driver. It implements Oracle-specific catalog discovery, SQL generation, and type mapping on top of an internal ODBC transport layer.
 
 ## Technology Stack
 
@@ -59,8 +59,7 @@ make test_reldebug   # Test relwithdebinfo build
 ./build/release/test/unittest "test_name_pattern"
 
 # Examples of single test patterns:
-./build/release/test/unittest "test/odbc*"          # All ODBC tests
-./build/release/test/unittest "test/odbc_scan"      # Specific test
+./build/release/test/unittest "test/sql/oracle_scanner*"
 ./build/release/test/unittest "*connection*"        # Tests with "connection" in name
 
 # Skip tests (for CI outside docker)
@@ -101,7 +100,7 @@ SKIP_TESTS=1 make release
 //===----------------------------------------------------------------------===//
 //                         DuckDB
 //
-// odbc_scanner.hpp
+// oracle_scanner.hpp
 //
 //
 //===----------------------------------------------------------------------===//
@@ -179,7 +178,8 @@ inline void ODBCStatementDelete(SQLHSTMT stmt) {
 - Tests should be in `test/` directory
 - Use DuckDB's test framework
 - Test patterns follow DuckDB conventions
-- Tests require ODBC driver to be available
+- Registration and read-only tests do not require an Oracle driver
+- Live database tests require Oracle Instant Client ODBC and an Oracle instance
 
 ### Git/Development Workflow
 
@@ -194,8 +194,11 @@ inline void ODBCStatementDelete(SQLHSTMT stmt) {
 - `Makefile` - Extension build targets
 - `extension_config.cmake` - DuckDB extension config
 - `.clang-format` - Code formatting rules
-- `src/odbc_scanner.cpp` - Main table function implementations
-- `src/include/odbc_scanner.hpp` - Main header with function definitions
+- `src/odbc_scanner.cpp` - Oracle scan and query table functions
+- `src/oracle_extension.cpp` - Extension registration and public settings
+- `src/storage/odbc_schema_set.cpp` - Oracle owner discovery
+- `src/storage/odbc_table_set.cpp` - Oracle table/view discovery
+- `src/odbc_types.cpp` - Oracle type mapping
 
 ### Agent Workflow Requirements
 
@@ -215,7 +218,7 @@ assistant: Clients are marked as failed in the `connectToServer` function in src
 ### Important Notes
 
 1. This is a DuckDB loadable extension - it links against DuckDB
-2. The extension uses ODBC for external database connectivity
+2. The public catalog is Oracle-specific; ODBC is an internal transport detail
 3. Build requires ODBC development libraries (`unixODBC-dev`)
-4. Tests may be skipped outside of Docker environment
+4. The extension only accepts `ATTACH ... (READ_ONLY)`
 5. The DuckDB submodule must be initialized: `git submodule update --init --recursive`

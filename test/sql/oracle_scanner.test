@@ -1,0 +1,46 @@
+# name: test/sql/oracle_scanner.test
+# description: Oracle scanner registration, secrets, and read-only boundary
+# group: [sql]
+
+statement ok
+LOAD 'build/release/extension/oracle_scanner/oracle_scanner.duckdb_extension';
+
+query T
+SELECT function_name
+FROM duckdb_functions()
+WHERE function_name IN ('oracle_clear_cache', 'oracle_metadata', 'oracle_query')
+ORDER BY function_name;
+----
+oracle_clear_cache
+oracle_metadata
+oracle_query
+
+statement ok
+CREATE TEMPORARY SECRET oracle_scanner_test_secret (
+    TYPE oracle,
+    DRIVER 'Oracle ODBC',
+    DBQ '//oracle.example:1521/service',
+    UID 'app',
+    PWD 'do_not_expose'
+);
+
+query TT
+SELECT name, type
+FROM duckdb_secrets()
+WHERE name = 'oracle_scanner_test_secret';
+----
+oracle_scanner_test_secret	oracle
+
+query I
+SELECT count(*)
+FROM duckdb_secrets()
+WHERE name = 'oracle_scanner_test_secret'
+  AND secret_string NOT LIKE '%do_not_expose%'
+  AND secret_string LIKE '%pwd=redacted%';
+----
+1
+
+statement error
+ATTACH 'Driver={missing};DBQ=x;UID=u;PWD=secret;' AS oracle_rw (TYPE oracle_scanner);
+----
+oracle_scanner is read-only

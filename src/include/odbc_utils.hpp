@@ -19,10 +19,19 @@ struct ODBCConnectionParameters {
 	string driver;
 	string server;
 	string database;
+	string dbq;
 	string uid;
 	string pwd;
 	uint32_t port = 0;
 	vector<string> extra_params;
+};
+
+// Oracle identifier syntax is significant for owner names. Unquoted names use
+// Oracle's uppercase normalization, while double-quoted names are preserved
+// exactly and use doubled double-quotes as escapes.
+struct OracleIdentifier {
+	string name;
+	bool quoted = false;
 };
 
 enum class ODBCResultStreaming { UNINITIALIZED, ALLOW_STREAMING, FORCE_MATERIALIZATION };
@@ -40,6 +49,7 @@ public:
 	static string EscapeQuotes(const string &text, char quote);
 	static string WriteQuoted(const string &text, char quote);
 	static string TransformConstant(const Value &val);
+	static OracleIdentifier ParseOracleIdentifier(const string &identifier);
 };
 
 using ODBCStatementPtr = duckdb::unique_ptr<void, void (*)(SQLHSTMT)>;

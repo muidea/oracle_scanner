@@ -3,10 +3,9 @@ include_directories(include)
 add_subdirectory(storage)
 
 add_library(
-  odbc_ext_library OBJECT
+  oracle_ext_library OBJECT
   odbc_connection.cpp
-  odbc_execute.cpp
-  odbc_extension.cpp
+  oracle_extension.cpp
   odbc_filter_pushdown.cpp
   odbc_metadata.cpp
   odbc_parameter.cpp
@@ -16,5 +15,5 @@ add_library(
   odbc_types.cpp
   odbc_utils.cpp)
 set(ALL_OBJECT_FILES
-    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:odbc_ext_library>
+    ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:oracle_ext_library>
     PARENT_SCOPE)

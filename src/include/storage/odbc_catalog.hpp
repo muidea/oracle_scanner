@@ -17,7 +17,8 @@ class ODBCSchemaEntry;
 
 class ODBCCatalog : public Catalog {
 public:
-	explicit ODBCCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, AccessMode access_mode);
+	explicit ODBCCatalog(AttachedDatabase &db_p, string connection_string, string attach_path, string default_schema,
+	                     AccessMode access_mode);
 	~ODBCCatalog();
 
 	string connection_string;
@@ -27,7 +28,7 @@ public:
 public:
 	void Initialize(bool load_builtin) override;
 	string GetCatalogType() override {
-		return "odbc";
+		return "oracle";
 	}
 
 	static string GetConnectionString(ClientContext &context, const string &attach_path, string secret_name);
@@ -67,6 +68,12 @@ public:
 	ODBCConnectionPool &GetConnectionPool() {
 		return connection_pool;
 	}
+	string GetDefaultSchema() const override {
+		return default_schema;
+	}
+	bool DefaultSchemaWasQuoted() const {
+		return default_schema_was_quoted;
+	}
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
@@ -74,6 +81,7 @@ private:
 private:
 	ODBCSchemaSet schemas;
 	string default_schema;
+	bool default_schema_was_quoted = false;
 	ODBCConnectionPool connection_pool;
 };
 

@@ -68,14 +68,19 @@ string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &fil
 	}
 	case TableFilterType::IN_FILTER: {
 		auto &in_filter = filter.Cast<InFilter>();
-		string in_list;
-		for (auto &val : in_filter.values) {
-			if (!in_list.empty()) {
-				in_list += ", ";
+		vector<string> groups;
+		for (idx_t offset = 0; offset < in_filter.values.size(); offset += 1000) {
+			string in_list;
+			auto group_end = MinValue<idx_t>(offset + 1000, in_filter.values.size());
+			for (idx_t index = offset; index < group_end; index++) {
+				if (!in_list.empty()) {
+					in_list += ", ";
+				}
+				in_list += ODBCUtils::TransformConstant(in_filter.values[index]);
 			}
-			in_list += ODBCUtils::TransformConstant(val);
+			groups.push_back(column_name + " IN (" + in_list + ")");
 		}
-		return column_name + " IN (" + in_list + ")";
+		return groups.size() == 1 ? groups[0] : "(" + StringUtil::Join(groups, " OR ") + ")";
 	}
 	default:
 		throw InternalException("Unsupported table filter type");
@@ -83,7 +88,7 @@ string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &fil
 }
 
 string ODBCFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
-                                             const vector<string> &names) {
+                                            const vector<string> &names) {
 	if (!filters || filters->filters.empty()) {
 		// no filters
 		return string();

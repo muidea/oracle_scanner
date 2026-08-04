@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5.0)
-set(TARGET_NAME odbc_scanner)
+set(TARGET_NAME oracle_scanner)
 project(${TARGET_NAME})
 
 # Platform-specific dependency handling (Windows and Linux)

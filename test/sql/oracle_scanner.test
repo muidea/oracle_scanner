@@ -8,12 +8,13 @@ LOAD 'build/release/extension/oracle_scanner/oracle_scanner.duckdb_extension';
 query T
 SELECT function_name
 FROM duckdb_functions()
-WHERE function_name IN ('oracle_clear_cache', 'oracle_metadata', 'oracle_query')
+WHERE function_name IN ('oracle_clear_cache', 'oracle_metadata', 'oracle_query', 'oracle_relational_metadata')
 ORDER BY function_name;
 ----
 oracle_clear_cache
 oracle_metadata
 oracle_query
+oracle_relational_metadata
 
 statement ok
 CREATE TEMPORARY SECRET oracle_scanner_test_secret (

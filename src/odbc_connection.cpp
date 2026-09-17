@@ -9,6 +9,9 @@
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
 #include "encoding_utils.hpp"
+
+#include <cstdlib>
+#include <mutex>
 namespace duckdb {
 
 static bool debug_odbc_print_queries = false;
@@ -70,6 +73,18 @@ ODBCConnection &ODBCConnection::operator=(ODBCConnection &&other) noexcept {
 }
 
 shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, const string &connection_string) {
+#ifndef _WIN32
+	static std::once_flag oracle_client_encoding_once;
+	std::call_once(oracle_client_encoding_once, []() {
+		// Oracle's SQLGetData path falls back to the process ANSI character set
+		// when NLS_LANG is absent, replacing non-ASCII identifiers and values
+		// with '?'. Respect an explicit deployment setting, otherwise request
+		// UTF-8 before the Oracle client is initialized by the first connection.
+		if (!std::getenv("NLS_LANG")) {
+			setenv("NLS_LANG", "AMERICAN_AMERICA.AL32UTF8", 0);
+		}
+	});
+#endif
 	SQLHENV env = SQL_NULL_HENV;
 	SQLHDBC dbc = ODBCUtils::Connect(connection_string, env);
 	auto owned_connection = make_shared_ptr<OwnedODBCConnection>(dbc, env);

@@ -156,6 +156,11 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		auto lower_type_name = StringUtil::Lower(type_name);
 		if (ltype.id() == LogicalTypeId::TIMESTAMP) {
 			field.c_type = SQL_C_TYPE_TIMESTAMP;
+		} else if (ltype.id() == LogicalTypeId::VARCHAR) {
+			// SQLGetData(SQL_C_CHAR) uses the Oracle client's ANSI conversion and
+			// replaces non-ASCII identifiers with '?'. Read text as UTF-16 and
+			// convert it to UTF-8 when writing the DuckDB vector.
+			field.c_type = SQL_C_WCHAR;
 		} else if (ltype.id() == LogicalTypeId::DECIMAL ||
 		           (ltype.id() == LogicalTypeId::DOUBLE && lower_type_name == "number")) {
 			field.c_type = SQL_C_CHAR;
@@ -177,14 +182,14 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 }
 
 static void InitBinds(vector<ODBCField> &fields, SQLHSTMT stmt) {
-	for (SQLSMALLINT i = 0; i < fields.size(); i++) {
-		ODBCField &f = fields[i];
-		SQLRETURN retcode =
-		    SQLBindCol(stmt, i + 1, f.c_type, f.bind_buffer.data(), f.bind_buffer.size(), &f.bind_length);
-
-		if (!SQL_SUCCEEDED(retcode)) {
-			throw IOException("Failed to bind column %d for ODBC query\n", i + 1);
-		}
+	(void)stmt;
+	for (auto &field : fields) {
+		// Oracle's ODBC driver can corrupt adjacent bound character buffers when
+		// its internal row prefetch window advances. This is reproducible with
+		// large ALL_TAB_COLUMNS results around the 2048-row boundary. Reading all
+		// columns with SQLGetData also avoids mixing SQLBindCol and SQLGetData for
+		// truncated values, which is not supported consistently by ODBC drivers.
+		field.column_bound = false;
 	}
 }
 
@@ -204,7 +209,11 @@ static size_t TextPayloadLength(const vector<char> &buffer, SQLSMALLINT c_type) 
 	return 0;
 }
 
-static void ReadUnboundVariableData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query) {
+static bool IsVariableWidthCType(SQLSMALLINT c_type) {
+	return c_type == SQL_C_CHAR || c_type == SQL_C_WCHAR || c_type == SQL_C_BINARY;
+}
+
+static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query) {
 	static constexpr size_t CHUNK_SIZE = 8192;
 	static constexpr size_t MAX_VALUE_SIZE = MAX_BIND_BUFFER_SIZE * 16;
 	vector<char> buffer(CHUNK_SIZE);
@@ -214,6 +223,21 @@ static void ReadUnboundVariableData(vector<ODBCField> &fields, SQLHSTMT stmt, co
 			continue;
 		}
 		field.value_buffer.clear();
+		if (!IsVariableWidthCType(field.c_type)) {
+			memset(field.bind_buffer.data(), 0, field.bind_buffer.size());
+			SQLLEN indicator = 0;
+			auto retcode = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, field.bind_buffer.data(),
+			                          static_cast<SQLLEN>(field.bind_buffer.size()), &indicator);
+			if (indicator == SQL_NULL_DATA) {
+				field.bind_length = SQL_NULL_DATA;
+				continue;
+			}
+			if (!SQL_SUCCEEDED(retcode) || retcode == SQL_SUCCESS_WITH_INFO) {
+				throw IOException("Failed to read fixed-width column %zu for ODBC query \"%s\"", i + 1, query.c_str());
+			}
+			field.bind_length = indicator == SQL_NO_TOTAL ? static_cast<SQLLEN>(field.bind_buffer.size()) : indicator;
+			continue;
+		}
 		while (true) {
 			memset(buffer.data(), 0, buffer.size());
 			SQLLEN indicator = 0;
@@ -532,6 +556,7 @@ bool ODBCResult::FetchNext() {
 		return false;
 	}
 
+	ReadUnboundData(fields, stmt.get(), query);
 	HandleTruncatedData();
 
 	for (size_t i = 0; i < fields.size(); i++) {

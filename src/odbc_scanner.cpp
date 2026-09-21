@@ -253,6 +253,13 @@ ODBCScanFunction::ODBCScanFunction()
 //===--------------------------------------------------------------------===//
 // ODBC Query
 //===--------------------------------------------------------------------===//
+// oracle_query is used by the federated metadata scanner for direct catalog
+// reads.  It force-materializes the ODBC result during bind, so an Oracle
+// owner whose catalog query cannot finish must be bounded at the ODBC layer;
+// otherwise DuckDB's native read gate remains occupied until the driver
+// returns.  A timeout is an explicit metadata error, never a schema fallback.
+static constexpr uint32_t ORACLE_QUERY_TIMEOUT_SECONDS = 60;
+
 static void ValidateOracleReadOnlyQuery(const string &sql) {
 	auto normalized = StringUtil::Lower(sql);
 	StringUtil::Trim(normalized);
@@ -302,7 +309,16 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 		params = StructValue::GetChildren(struct_val);
 	}
 
-	auto result = transaction.GetConnection().Query(sql, std::move(params), ODBCResultStreaming::FORCE_MATERIALIZATION);
+	unique_ptr<ODBCResult> result;
+	if (params.empty()) {
+		result = transaction.GetConnection().QueryWithTimeout(sql, ODBCResultStreaming::FORCE_MATERIALIZATION,
+		                                                     ORACLE_QUERY_TIMEOUT_SECONDS);
+	} else {
+		// Keep parameterized oracle_query calls on the existing prepared-statement
+		// path. Metadata queries are literal-only, while callers using params must
+		// retain the ABI's parameter binding semantics.
+		result = transaction.GetConnection().Query(sql, std::move(params), ODBCResultStreaming::FORCE_MATERIALIZATION);
+	}
 	for (auto &field : result->Fields()) {
 		names.push_back(field.name);
 		return_types.push_back(field.duckdb_type);

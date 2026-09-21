@@ -3,6 +3,9 @@ PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 # Configuration of extension
 EXT_NAME=oracle_scanner
 EXT_CONFIG=${PROJ_DIR}extension_config.cmake
+# The fedquery runtime loads DuckDB v1.5.3 extensions. Keep the default
+# metadata/version in sync so a plain `make release` cannot emit v0.0.1.
+OVERRIDE_GIT_DESCRIBE ?= v1.5.3
 
 # ====== vcpkg Configuration ======
 # Auto-detect vcpkg installation path

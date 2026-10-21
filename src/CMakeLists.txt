@@ -14,6 +14,9 @@ add_library(
   odbc_storage.cpp
   odbc_types.cpp
   odbc_utils.cpp)
+if(ORACLE_GUARDED_CRUD)
+ target_sources(oracle_ext_library PRIVATE oracle_guarded_crud.cpp)
+endif()
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:oracle_ext_library>
     PARENT_SCOPE)

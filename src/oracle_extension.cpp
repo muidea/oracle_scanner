@@ -15,6 +15,11 @@
 #include "storage/odbc_optimizer.hpp"
 
 using namespace duckdb;
+#ifdef ORACLE_GUARDED_CRUD
+namespace duckdb {
+void RegisterOracleGuardedCRUD(ExtensionLoader &loader);
+}
+#endif
 
 static void SetODBCDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
 	ODBCConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
@@ -86,6 +91,9 @@ void SetOracleSecretParameters(CreateSecretFunction &function) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+#ifdef ORACLE_GUARDED_CRUD
+	RegisterOracleGuardedCRUD(loader);
+#endif
 	// The ODBC driver manager handles Oracle driver initialization.
 	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);

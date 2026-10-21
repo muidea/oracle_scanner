@@ -365,6 +365,12 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 		throw IOException("Failed to allocate ODBC connection handle");
 	}
 
+	ret = SQLSetConnectAttr(dbc, SQL_ATTR_LOGIN_TIMEOUT, reinterpret_cast<SQLPOINTER>(10), 0);
+	if (!SQL_SUCCEEDED(ret)) {
+		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
+		SQLFreeHandle(SQL_HANDLE_ENV, env);
+		throw IOException("Unable to configure bounded Oracle login");
+	}
 	ODBCConnectionParameters config;
 	unordered_set<string> unused_params;
 	std::tie(config, unused_params) = ParseConnectionParameters(dsn);

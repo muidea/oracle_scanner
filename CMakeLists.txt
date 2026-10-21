@@ -24,6 +24,11 @@ if(ODBC_INCLUDE_DIR)
     include_directories(BEFORE ${ODBC_INCLUDE_DIR})
 endif()
 
+option(ORACLE_GUARDED_CRUD "Enable restricted scanner-owned Oracle CRUD" OFF)
+if(ORACLE_GUARDED_CRUD)
+ add_compile_definitions(ORACLE_GUARDED_CRUD)
+endif()
+
 add_subdirectory(src)
 
 set(PARAMETERS "-no-warnings")

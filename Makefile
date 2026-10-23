@@ -50,7 +50,19 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # ====== Additional Helper Targets ======
 
-.PHONY: help init-vcpkg check-deps
+.PHONY: help init-vcpkg check-deps test-connection-cleanup
+
+# Native ODBC cleanup regression with mock handles; opens no database.
+# Discard unused DuckDB header functions so this test needs neither libduckdb
+# nor libodbc. Keep assertions enabled even when the extension is Release.
+test-connection-cleanup:
+	@set -eu; \
+	cleanup_test_binary=$$(mktemp "$${TMPDIR:-/tmp}/oracle-connection-cleanup.XXXXXX"); \
+	trap 'rm -f "$$cleanup_test_binary"' EXIT; \
+	$(CXX) -std=c++17 -O2 -UNDEBUG -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	  -Isrc/include -Iduckdb/src/include test/odbc_connection_cleanup.cpp -o "$$cleanup_test_binary"; \
+	"$$cleanup_test_binary"; \
+	printf 'Oracle ODBC connection cleanup regression PASS\n'
 
 help:
 	@echo "oracle_scanner - DuckDB Oracle scanner extension"
@@ -59,6 +71,7 @@ help:
 	@echo "  make release       - Build release version"
 	@echo "  make debug         - Build debug version"
 	@echo "  make test          - Run tests"
+	@echo "  make test-connection-cleanup - Run native cleanup regression (no source DB)"
 	@echo "  make clean         - Clean build artifacts"
 	@echo "  make format        - Format source code"
 	@echo "  make init-vcpkg    - Initialize vcpkg installation"

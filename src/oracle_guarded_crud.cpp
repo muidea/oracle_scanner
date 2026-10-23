@@ -13,6 +13,7 @@
 #include "storage/odbc_catalog.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -121,6 +122,16 @@ public:
 		case 1426:
 			error = "22003";
 			break;
+		case 12899:
+			error = "22001";
+			break;
+		case 1839:
+		case 1841:
+		case 1843:
+		case 1847:
+		case 1861:
+			error = "22007";
+			break;
 		case 60:
 			error = "40P01";
 			break;
@@ -226,7 +237,7 @@ public:
 				if (v.type().id() != LogicalTypeId::VARCHAR)
 					Reject();
 				values[i] = v.GetValue<string>();
-				if (values[i].empty() || values[i].size() > 1002)
+				if (values[i].empty() || values[i].size() > 4000 || values[i].find('\0') != string::npos)
 					Reject();
 				lengths[i] = values[i].size();
 			}
@@ -385,15 +396,39 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 
 	stage = "source_columns";
 	auto cols = s.Rows(
-	    "SELECT COLUMN_NAME,DATA_TYPE,NULLABLE,TO_CHAR(COLUMN_ID),TO_CHAR(DATA_PRECISION),TO_CHAR(DATA_SCALE) "
+	    "SELECT "
+	    "COLUMN_NAME,DATA_TYPE,NULLABLE,TO_CHAR(COLUMN_ID),COALESCE(TO_CHAR(DATA_PRECISION),'0'),COALESCE(TO_CHAR(DATA_"
+	    "SCALE),'0'),"
+	    "TO_CHAR(DATA_LENGTH),COALESCE(TO_CHAR(CHAR_LENGTH),'0'),COALESCE(CHAR_USED,'-') "
 	    "FROM DBA_TAB_COLS WHERE " +
 	    filter +
-	    " AND DATA_TYPE='NUMBER' AND DATA_TYPE_OWNER IS NULL AND DATA_PRECISION BETWEEN 1 AND 38 AND DATA_SCALE "
-	    "BETWEEN 0 AND DATA_PRECISION AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO' AND IDENTITY_COLUMN='NO' AND "
+	    " AND ((DATA_TYPE='NUMBER' AND DATA_PRECISION BETWEEN 1 AND 38 AND DATA_SCALE BETWEEN 0 AND DATA_PRECISION)"
+	    " OR (DATA_TYPE='VARCHAR2' AND DATA_LENGTH BETWEEN 1 AND 4000 AND CHAR_LENGTH BETWEEN 1 AND DATA_LENGTH AND "
+	    "CHAR_USED IN('B','C'))"
+	    " OR DATA_TYPE='DATE' OR (DATA_TYPE "
+	    "IN('TIMESTAMP(0)','TIMESTAMP(1)','TIMESTAMP(2)','TIMESTAMP(3)','TIMESTAMP(4)','TIMESTAMP(5)','TIMESTAMP(6)') "
+	    "AND DATA_SCALE BETWEEN 0 AND 6))"
+	    " AND DATA_TYPE_OWNER IS NULL AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO' AND IDENTITY_COLUMN='NO' AND "
 	    "DEFAULT_ON_NULL='NO' AND COALESCE(DEFAULT_LENGTH,0)=0 ORDER BY COLUMN_ID");
 	auto count = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TAB_COLS WHERE " + filter);
 	if (cols.empty() || cols.size() > 1024 || count != std::to_string(cols.size()))
 		Reject();
+	string charset;
+	for (auto &c : cols) {
+		if (c[1] != "VARCHAR2")
+			continue;
+		stage = "source_charset";
+		// SQL_C_CHAR binds UTF-8 bytes. Prove both sides are lossless rather
+		// than inheriting an environment-dependent Oracle client conversion.
+		const auto lang = std::getenv("NLS_LANG");
+		if (!lang || !StringUtil::EndsWith(StringUtil::Upper(lang), ".AL32UTF8"))
+			Reject();
+		charset = s.Scalar("SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER='NLS_CHARACTERSET'");
+		if (charset != "AL32UTF8")
+			Reject();
+		break;
+	}
+
 	stage = "source_constraints";
 	auto constraints = s.Rows(
 	    "SELECT CONSTRAINT_NAME,CONSTRAINT_TYPE,DEFERRABLE,DEFERRED,STATUS,VALIDATED,COALESCE(SEARCH_CONDITION_VC,' "
@@ -441,9 +476,15 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 		if (!first)
 			out += ",";
 		first = false;
-		out += "{\"name\":" + JSON(c[0]) +
-		       ",\"data_type\":\"NUMBER\",\"nullable\":" + (c[2] == "Y" ? "true" : "false") + ",\"precision\":" + c[4] +
-		       ",\"scale\":" + c[5] + "}";
+		auto type = c[1];
+		if (StringUtil::StartsWith(type, "TIMESTAMP("))
+			type = "TIMESTAMP";
+		out += "{\"name\":" + JSON(c[0]) + ",\"data_type\":" + JSON(type) +
+		       ",\"nullable\":" + (c[2] == "Y" ? "true" : "false") + ",\"precision\":" + c[4] + ",\"scale\":" + c[5];
+		if (type == "VARCHAR2")
+			out += ",\"max_length\":" + c[6] + ",\"char_length\":" + c[7] + ",\"char_used\":" + JSON(c[8]) +
+			       ",\"charset\":" + JSON(charset);
+		out += "}";
 	}
 	out += "]}";
 	if (out.size() > 1024 * 1024)
@@ -515,6 +556,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		if (!CompatibleVersion(version) || (d.execute && version != d.version))
 			Reject();
 		s.Exec("ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,'");
+		s.Exec("ALTER SESSION SET NLS_CALENDAR='GREGORIAN'");
 		stage = "source_lock";
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE WAIT 5");
 

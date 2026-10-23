@@ -31,6 +31,16 @@ struct OwnedODBCConnection {
 	}
 	~OwnedODBCConnection() {
 		if (connection) {
+			// A SQL-text COMMIT/ROLLBACK does not finish the ODBC driver's
+			// manual transaction state. SQLDisconnect can then return 25000,
+			// leaving both the native handle and the Oracle session alive.
+			// End that state through ODBC before disconnecting. Cleanup must
+			// only roll back; it must never commit an uncertain operation.
+			SQLULEN autocommit = SQL_AUTOCOMMIT_OFF;
+			auto mode = SQLGetConnectAttr(connection, SQL_ATTR_AUTOCOMMIT, &autocommit, sizeof(autocommit), nullptr);
+			if (!SQL_SUCCEEDED(mode) || autocommit == SQL_AUTOCOMMIT_OFF) {
+				SQLEndTran(SQL_HANDLE_DBC, connection, SQL_ROLLBACK);
+			}
 			SQLDisconnect(connection);
 			SQLFreeHandle(SQL_HANDLE_DBC, connection);
 			connection = nullptr;

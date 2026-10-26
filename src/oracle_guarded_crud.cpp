@@ -491,17 +491,18 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 		Reject();
 	return out;
 }
+// Version is an opaque source identity. Capability is proved by the live
+// session/catalog checks below, never by a fixed release interval.
 static bool CompatibleVersion(const string &v) {
-	auto p = StringUtil::Split(v, '.');
-	if (p.size() != 5)
+	if (v.empty() || v.size() > 1024 || StringUtil::CharacterIsSpace(v.front()) ||
+	    StringUtil::CharacterIsSpace(v.back()))
 		return false;
-	for (auto &part : p)
-		if (part.empty() || part.size() > 10 || part.find_first_not_of("0123456789") != string::npos)
+	for (auto c : v)
+		if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) == 127)
 			return false;
-	if (p[0] == "12")
-		return p[1] == "2";
-	return p[0] == "18" || p[0] == "19" || p[0] == "21" || p[0] == "23";
+	return true;
 }
+
 static void Writable(SQLHDBC dbc) {
 	if (!SQL_SUCCEEDED(
 	        SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, reinterpret_cast<SQLPOINTER>(SQL_MODE_READ_WRITE), 0)))
@@ -547,12 +548,13 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		if (!SQL_SUCCEEDED(SQLGetInfo(connection->GetConn(), SQL_DBMS_NAME, dbms, sizeof(dbms), &len)) ||
 		    StringUtil::Lower(reinterpret_cast<char *>(dbms)) != "oracle")
 			Reject();
-		version = s.Scalar("SELECT VERSION FROM PRODUCT_COMPONENT_VERSION WHERE PRODUCT LIKE 'Oracle Database%'");
-		if (!CompatibleVersion(version))
+		// VERSION_FULL is a catalog capability, not a release-number inference.
+		const auto full_version = s.Scalar("SELECT COUNT(*) FROM ALL_TAB_COLUMNS WHERE OWNER='SYS' AND "
+		                                   "TABLE_NAME='PRODUCT_COMPONENT_VERSION' AND COLUMN_NAME='VERSION_FULL'");
+		if (full_version != "0" && full_version != "1")
 			Reject();
-		if (StringUtil::Split(version, '.')[0] != "12")
-			version =
-			    s.Scalar("SELECT VERSION_FULL FROM PRODUCT_COMPONENT_VERSION WHERE PRODUCT LIKE 'Oracle Database%'");
+		version = s.Scalar("SELECT " + string(full_version == "1" ? "VERSION_FULL" : "VERSION") +
+		                   " FROM PRODUCT_COMPONENT_VERSION WHERE PRODUCT LIKE 'Oracle Database%'");
 		if (!CompatibleVersion(version) || (d.execute && version != d.version))
 			Reject();
 		s.Exec("ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,'");

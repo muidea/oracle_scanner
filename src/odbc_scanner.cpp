@@ -312,7 +312,7 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 	unique_ptr<ODBCResult> result;
 	if (params.empty()) {
 		result = transaction.GetConnection().QueryWithTimeout(sql, ODBCResultStreaming::FORCE_MATERIALIZATION,
-		                                                     ORACLE_QUERY_TIMEOUT_SECONDS);
+		                                                      ORACLE_QUERY_TIMEOUT_SECONDS);
 	} else {
 		// Keep parameterized oracle_query calls on the existing prepared-statement
 		// path. Metadata queries are literal-only, while callers using params must
@@ -404,7 +404,16 @@ static OracleRelationalCapabilities ProbeOracleRelationalCapabilities(ODBCConnec
 }
 
 static string OracleRelationalMetadataSQL(const string &category, const string &owner,
-                                          const OracleRelationalCapabilities &capabilities) {
+                                          const OracleRelationalCapabilities &capabilities,
+                                          const vector<string> &tables) {
+	string table_scope;
+	for (const auto &table : tables) {
+		if (!table_scope.empty())
+			table_scope += ",";
+		table_scope += OracleMetadataLiteral(table);
+	}
+	if (!table_scope.empty())
+		table_scope = " AND c.table_name IN (" + table_scope + ")";
 	if (category == "columnProperties") {
 		auto identity_join = string();
 		auto identity_generation = string("''");
@@ -426,7 +435,7 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 		       "column_id) AS column_id,c.nullable AS is_nullable,c.data_default AS default_definition," +
 		       identity_generation + " AS identity_generation," + virtual_column +
 		       " AS virtual_column,c.data_type AS data_type FROM " + column_catalog + " c" + identity_join +
-		       " WHERE c.owner=" + OracleMetadataLiteral(owner) + visible_condition +
+		       " WHERE c.owner=" + OracleMetadataLiteral(owner) + table_scope + visible_condition +
 		       " ORDER BY c.table_name,c.column_id";
 	}
 	if (category == "constraints") {
@@ -448,9 +457,46 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 		       "constraint_name=c.r_constraint_name LEFT JOIN all_cons_columns rcc ON rcc.owner=rc.owner AND rcc."
 		       "constraint_name=rc.constraint_name AND rcc.position=cc.position AND rcc.position IS NOT NULL WHERE "
 		       "c.owner=" +
-		       OracleMetadataLiteral(owner) +
+		       OracleMetadataLiteral(owner) + table_scope +
 		       " AND c.constraint_type IN ('P','U','R','C') ORDER BY "
 		       "c.table_name,c.constraint_name,NVL(cc.position,0),cc.column_name";
+	}
+	if (category == "indexPartitionStates") {
+		auto partition_count = [](const string &extra) {
+			return "TO_CHAR((SELECT COUNT(*) FROM all_ind_partitions p WHERE p.index_owner=i.owner AND "
+			       "p.index_name=i.index_name" +
+			       extra + "))";
+		};
+		auto subpartition_count = [](const string &extra) {
+			return "TO_CHAR((SELECT COUNT(*) FROM all_ind_subpartitions p WHERE p.index_owner=i.owner AND "
+			       "p.index_name=i.index_name" +
+			       extra + "))";
+		};
+		return "SELECT i.table_owner AS owner_name,i.table_name AS table_name,i.owner||':'||i.index_name AS index_id,"
+		       "NVL(TO_CHAR(pi.partition_count),'') AS expected_partitions,NVL(pi.subpartitioning_type,'') AS "
+		       "subpartitioning_type," +
+		       partition_count("") + " AS actual_partitions," +
+		       partition_count(" AND p.composite='NO' AND p.status IN ('UNUSABLE','DISABLED')") +
+		       " AS unusable_partitions," +
+		       partition_count(" AND p.composite='NO' AND (p.status IS NULL OR p.status NOT IN "
+		                       "('USABLE','VALID','UNUSABLE','DISABLED'))") +
+		       " AS unknown_partitions," + partition_count(" AND p.composite='YES'") +
+		       " AS composite_partitions,"
+		       "TO_CHAR((SELECT NVL(SUM(p.subpartition_count),0) FROM all_ind_partitions p WHERE p.index_owner=i.owner "
+		       "AND p.index_name=i.index_name AND p.composite='YES')) AS expected_subpartitions," +
+		       subpartition_count("") + " AS actual_subpartitions," +
+		       subpartition_count(" AND p.status IN ('UNUSABLE','DISABLED')") + " AS unusable_subpartitions," +
+		       subpartition_count(
+		           " AND (p.status IS NULL OR p.status NOT IN ('USABLE','VALID','UNUSABLE','DISABLED'))") +
+		       " AS unknown_subpartitions," +
+		       partition_count(" AND (p.composite IS NULL OR p.composite NOT IN ('YES','NO'))") +
+		       " AS unknown_composites," +
+		       partition_count(" AND p.composite='YES' AND (p.subpartition_count IS NULL OR p.subpartition_count<=0)") +
+		       " AS empty_composites"
+		       " FROM all_indexes i LEFT JOIN all_part_indexes pi ON pi.owner=i.owner AND pi.index_name=i.index_name"
+		       " WHERE i.table_owner=" +
+		       OracleMetadataLiteral(owner) + StringUtil::Replace(table_scope, "c.table_name", "i.table_name") +
+		       " AND i.partitioned='YES' AND i.index_type<>'LOB' ORDER BY i.table_name,i.index_name";
 	}
 	if (category == "indexes") {
 		auto expression_join = string();
@@ -471,7 +517,8 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 		       expression +
 		       " AS column_expression FROM all_indexes i JOIN all_ind_columns ic ON ic.index_owner=i.owner AND ic."
 		       "index_name=i.index_name AND ic.table_owner=i.table_owner AND ic.table_name=i.table_name" +
-		       expression_join + " WHERE i.table_owner=" + OracleMetadataLiteral(owner) + " AND i.index_type<>'LOB'" +
+		       expression_join + " WHERE i.table_owner=" + OracleMetadataLiteral(owner) +
+		       StringUtil::Replace(table_scope, "c.table_name", "i.table_name") + " AND i.index_type<>'LOB'" +
 		       index_type_condition + " ORDER BY i.table_name,i.index_name,ic.column_position";
 	}
 	throw InvalidInputException("Unsupported oracle_relational_metadata category \"%s\"", category);
@@ -487,6 +534,19 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto category = input.inputs[1].GetValue<string>();
 	auto owner = input.inputs[2].GetValue<string>();
+	vector<string> tables;
+	if (input.inputs.size() == 4) {
+		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
+			if (value.IsNull())
+				throw BinderException("Oracle table scope cannot contain NULL");
+			auto table = value.GetValue<string>();
+			if (table.empty() || table.size() > 128 || table.find('\0') != string::npos)
+				throw BinderException("Oracle table scope contains an invalid name");
+			tables.push_back(table);
+		}
+		if (tables.empty() || tables.size() > 128)
+			throw BinderException("Oracle table scope must contain 1 to 128 names");
+	}
 	StringUtil::Trim(owner);
 	if (owner.empty()) {
 		throw BinderException("Oracle owner passed to oracle_relational_metadata cannot be empty");
@@ -512,7 +572,7 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 		sql = OracleCapabilitySQL();
 	} else {
 		auto capabilities = ProbeOracleRelationalCapabilities(connection);
-		sql = OracleRelationalMetadataSQL(category, owner, capabilities);
+		sql = OracleRelationalMetadataSQL(category, owner, capabilities, tables);
 	}
 	auto result = connection.QueryWithTimeout(sql, ODBCResultStreaming::FORCE_MATERIALIZATION,
 	                                          ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS);
@@ -526,8 +586,11 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	return make_uniq<ODBCQueryBindData>(catalog, std::move(result), std::move(sql));
 }
 
-ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction()
-    : TableFunction("oracle_relational_metadata", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool scoped)
+    : TableFunction(scoped ? "oracle_relational_metadata_scoped_v1" : "oracle_relational_metadata",
+                    scoped ? vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+                                                  LogicalType::LIST(LogicalType::VARCHAR)}
+                           : vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
                     ODBCScan, ODBCRelationalMetadataBind, ODBCQueryInitGlobalState, ODBCInitLocalState) {
 	serialize = ODBCScanSerialize;
 	deserialize = ODBCScanDeserialize;

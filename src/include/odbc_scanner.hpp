@@ -75,7 +75,7 @@ public:
 
 class ODBCRelationalMetadataFunction : public TableFunction {
 public:
-	ODBCRelationalMetadataFunction();
+	explicit ODBCRelationalMetadataFunction(bool scoped = false);
 };
 
 class ODBCClearCacheFunction : public TableFunction {

@@ -11,6 +11,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "storage/odbc_catalog.hpp"
+#include "oracle_odbc_unicode.hpp"
 
 #include <atomic>
 #include <cstdlib>
@@ -171,7 +172,7 @@ public:
 	}
 	void Exec(const string &sql, bool cleanup = false) {
 		Start(cleanup);
-		auto rc = SQLExecDirect(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS);
+		auto rc = OracleODBCExecDirectUTF8(stmt.get(), sql);
 		if (rc == SQL_NO_DATA)
 			return;
 		Check(rc);
@@ -180,7 +181,7 @@ public:
 	}
 	vector<vector<string>> Rows(const string &sql, bool cleanup = false) {
 		Start(cleanup);
-		Check(SQLExecDirect(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS));
+		Check(OracleODBCExecDirectUTF8(stmt.get(), sql));
 		SQLSMALLINT cols = 0;
 		Check(SQLNumResultCols(stmt.get(), &cols));
 		if (cols < 1 || cols > 64)
@@ -222,12 +223,12 @@ public:
 	}
 	int64_t Execute(const string &sql, const vector<Value> &params, bool &sent) {
 		Start();
-		Check(SQLPrepare(stmt.get(), reinterpret_cast<SQLCHAR *>(const_cast<char *>(sql.c_str())), SQL_NTS));
+		Check(OracleODBCPrepareUTF8(stmt.get(), sql));
 		SQLSMALLINT count = 0;
 		Check(SQLNumParams(stmt.get(), &count));
 		if (count != params.size() || count > 2100)
 			Reject();
-		vector<string> values(params.size());
+		std::vector<std::vector<SQLWCHAR>> values(params.size());
 		vector<SQLLEN> lengths(params.size(), 0);
 		for (idx_t i = 0; i < params.size(); i++) {
 			auto &v = params[i];
@@ -236,14 +237,16 @@ public:
 			else {
 				if (v.type().id() != LogicalTypeId::VARCHAR)
 					Reject();
-				values[i] = v.GetValue<string>();
-				if (values[i].empty() || values[i].size() > 4000 || values[i].find('\0') != string::npos)
+				auto text = v.GetValue<string>();
+				if (text.empty() || text.size() > 4000 || text.find('\0') != string::npos)
 					Reject();
-				lengths[i] = values[i].size();
+				values[i] = OracleODBCUTF8ToWide(text);
+				lengths[i] = (values[i].size() - 1) * sizeof(SQLWCHAR);
 			}
-			Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR,
-			                       std::max<idx_t>(1, values[i].size()), 0, const_cast<char *>(values[i].c_str()),
-			                       values[i].size() + 1, &lengths[i]));
+			Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+			                       std::max<size_t>(1, values[i].empty() ? 0 : values[i].size() - 1), 0,
+			                       values[i].empty() ? nullptr : values[i].data(), values[i].size() * sizeof(SQLWCHAR),
+			                       &lengths[i]));
 		}
 
 		if (cancelled.load() || ctx.IsInterrupted()) {
@@ -418,8 +421,8 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 		if (c[1] != "VARCHAR2")
 			continue;
 		stage = "source_charset";
-		// SQL_C_CHAR binds UTF-8 bytes. Prove both sides are lossless rather
-		// than inheriting an environment-dependent Oracle client conversion.
+		// Keep the existing lossless source/client charset contract for guarded
+		// VARCHAR2 writes and the narrow-character metadata reads below.
 		const auto lang = std::getenv("NLS_LANG");
 		if (!lang || !StringUtil::EndsWith(StringUtil::Upper(lang), ".AL32UTF8"))
 			Reject();

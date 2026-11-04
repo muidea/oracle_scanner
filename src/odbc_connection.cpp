@@ -8,47 +8,13 @@
 
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
-#include "encoding_utils.hpp"
+#include "oracle_odbc_unicode.hpp"
 
 #include <cstdlib>
 #include <mutex>
 namespace duckdb {
 
 static bool debug_odbc_print_queries = false;
-
-static SQLRETURN SQLExecDirectWithFallback(SQLHSTMT stmt, const string &query) {
-#ifdef _WIN32
-	SQLRETURN retcode = SQLExecDirect(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
-	if (SQL_SUCCEEDED(retcode)) {
-		return retcode;
-	}
-	string query_gbk = UTF8ToGBK(query);
-	if (query_gbk != query) {
-		SQLFreeStmt(stmt, SQL_CLOSE);
-		retcode = SQLExecDirect(stmt, (SQLCHAR *)query_gbk.c_str(), SQL_NTS);
-	}
-	return retcode;
-#else
-	return SQLExecDirect(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
-#endif
-}
-
-static SQLRETURN SQLPrepareWithFallback(SQLHSTMT stmt, const string &query) {
-#ifdef _WIN32
-	SQLRETURN retcode = SQLPrepare(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
-	if (SQL_SUCCEEDED(retcode)) {
-		return retcode;
-	}
-	string query_gbk = UTF8ToGBK(query);
-	if (query_gbk != query) {
-		SQLFreeStmt(stmt, SQL_CLOSE);
-		retcode = SQLPrepare(stmt, (SQLCHAR *)query_gbk.c_str(), SQL_NTS);
-	}
-	return retcode;
-#else
-	return SQLPrepare(stmt, (SQLCHAR *)query.c_str(), SQL_NTS);
-#endif
-}
 
 ODBCConnection::ODBCConnection(shared_ptr<OwnedODBCConnection> connection_p, const std::string &dsn_p,
                                ODBCTypeConfig type_config_p)
@@ -110,7 +76,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		}
 
 		try {
-			retcode = SQLExecDirectWithFallback(hstmt, query);
+			retcode = OracleODBCExecDirectUTF8(hstmt, query);
 			if (!SQL_SUCCEEDED(retcode)) {
 				throw IOException("Failed to run query \"%s\"\n", query.c_str());
 			}
@@ -139,9 +105,9 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	if (params.empty()) {
-		retcode = SQLExecDirectWithFallback(stmt, query);
+		retcode = OracleODBCExecDirectUTF8(stmt, query);
 	} else {
-		retcode = SQLPrepareWithFallback(stmt, query);
+		retcode = OracleODBCPrepareUTF8(stmt, query);
 	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 获取详细的ODBC错误信息
@@ -197,6 +163,8 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 			    param_count, params.size(), query.c_str());
 		}
 
+		// ODBC retains pointers to parameter lengths as well as their data.
+		// Preserve the existing reservation before binding any parameter.
 		odbc_params.reserve(params.size());
 		for (Value &dp : params) {
 			ODBCParameter mp(query, std::move(dp));

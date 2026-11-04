@@ -50,7 +50,17 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # ====== Additional Helper Targets ======
 
-.PHONY: help init-vcpkg check-deps test-connection-cleanup
+.PHONY: help init-vcpkg check-deps test-connection-cleanup test-unicode-input
+
+# Prove Unicode statement encoding and single-send errors without a source DB.
+test-unicode-input:
+	@set -eu; \
+	unicode_test_binary=$$(mktemp "$${TMPDIR:-/tmp}/oracle-unicode-input.XXXXXX"); \
+	trap 'rm -f "$$unicode_test_binary"' EXIT; \
+	$(CXX) -std=c++17 -O2 -UNDEBUG -Wall -Wextra -Werror \
+	  -Isrc/include test/odbc_unicode_input.cpp -o "$$unicode_test_binary"; \
+	"$$unicode_test_binary"; \
+	printf 'Oracle ODBC Unicode input regression PASS\n'
 
 # Native ODBC cleanup regression with mock handles; opens no database.
 # Discard unused DuckDB header functions so this test needs neither libduckdb

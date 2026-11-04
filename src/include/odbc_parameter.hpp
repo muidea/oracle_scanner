@@ -19,6 +19,7 @@ struct ODBCParameter {
 	bool is_unsigned = false;
 
 	vector<char> bind_buffer;
+	std::vector<SQLWCHAR> wide_bind_buffer;
 	SQLLEN bind_length = 0;
 
 	ODBCParameter(const string &query, Value value_p);

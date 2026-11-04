@@ -1,5 +1,6 @@
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
+#include "oracle_odbc_unicode.hpp"
 
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/time.hpp"
@@ -173,11 +174,11 @@ SQLRETURN ODBCParameter::BindParameter(SQLHSTMT stmt, SQLUSMALLINT param_idx) {
 		                        bind_buffer.size(), 0, bind_buffer.data(), bind_buffer.size(), &bind_length);
 	case SQL_VARCHAR: {
 		string str = value.ToString();
-		bind_buffer.resize(str.size() + 1);
-		std::memcpy(bind_buffer.data(), str.c_str(), str.size() + 1);
-		bind_length = str.size();
-		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_VARCHAR, str.size(), 0,
-		                        bind_buffer.data(), bind_buffer.size(), &bind_length);
+		wide_bind_buffer = OracleODBCUTF8ToWide(str);
+		bind_length = (wide_bind_buffer.size() - 1) * sizeof(SQLWCHAR);
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
+		                        std::max<size_t>(1, wide_bind_buffer.size() - 1), 0, wide_bind_buffer.data(),
+		                        wide_bind_buffer.size() * sizeof(SQLWCHAR), &bind_length);
 	}
 	case SQL_VARBINARY: {
 		auto blob = StringValue::Get(value);

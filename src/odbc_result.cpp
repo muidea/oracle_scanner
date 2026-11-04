@@ -123,17 +123,24 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 
 	fields.reserve(num_cols);
 	for (SQLSMALLINT i = 0; i < num_cols; i++) {
-		SQLCHAR col_name[256];
+		vector<SQLWCHAR> col_name(256);
 		SQLCHAR type_name_buffer[256] = {};
 		SQLSMALLINT name_len, data_type, decimal_digits, nullable;
 		SQLSMALLINT type_name_len = 0;
 		SQLULEN column_size;
 		SQLLEN unused_numeric_attribute = 0;
 
-		retcode = SQLDescribeCol(stmt, i + 1, col_name, sizeof(col_name), &name_len, &data_type, &column_size,
-		                         &decimal_digits, &nullable);
+		retcode = SQLDescribeColW(stmt, i + 1, col_name.data(), static_cast<SQLSMALLINT>(col_name.size()), &name_len,
+		                          &data_type, &column_size, &decimal_digits, &nullable);
+		if (SQL_SUCCEEDED(retcode) && name_len >= static_cast<SQLSMALLINT>(col_name.size()) && name_len < SHRT_MAX) {
+			// SQLDescribeColW reports UTF-16 code units, excluding the terminator.
+			// Re-read only the descriptor when its name does not fit the initial buffer.
+			col_name.resize(static_cast<size_t>(name_len) + 1);
+			retcode = SQLDescribeColW(stmt, i + 1, col_name.data(), static_cast<SQLSMALLINT>(col_name.size()),
+			                          &name_len, &data_type, &column_size, &decimal_digits, &nullable);
+		}
 
-		if (!SQL_SUCCEEDED(retcode)) {
+		if (!SQL_SUCCEEDED(retcode) || name_len < 0 || static_cast<size_t>(name_len) >= col_name.size()) {
 			throw IOException("Failed to describe column %d for ODBC query \"%s\"\n", i + 1, query.c_str());
 		}
 
@@ -149,7 +156,7 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 
 		// Create field with placeholder information
 		ODBCField field(nullptr, std::move(ltype), type_config);
-		field.name = string(reinterpret_cast<char *>(col_name), name_len);
+		field.name = UTF16UnitsToUTF8(col_name.data(), static_cast<size_t>(name_len));
 		field.type_name = type_name;
 		field.odbc_type = data_type;
 		field.c_type = ODBCTypes::GetCType(data_type);

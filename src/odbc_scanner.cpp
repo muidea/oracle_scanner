@@ -414,6 +414,26 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 	}
 	if (!table_scope.empty())
 		table_scope = " AND c.table_name IN (" + table_scope + ")";
+	if (category == "columnExpressions" || category == "checkExpressions") {
+		// DBMS_XMLGEN safely converts legacy LONG catalog values into XML CLOB.
+		// Values are quoted twice: once for the fixed source SELECT, once for
+		// GETXMLTYPE's argument. No client SQL is accepted by this contract.
+		const bool columns = category == "columnExpressions";
+		const string item = columns ? "column_name" : "constraint_name";
+		const string expression = columns ? "data_default" : "search_condition";
+		const string catalog = columns ? "all_tab_cols" : "all_constraints";
+		const string filter = columns ? " AND virtual_column='YES' AND hidden_column='NO'" : " AND constraint_type='C'";
+		const string query = "SELECT c.owner,c.table_name,c." + item + ",c." + expression + " FROM " + catalog +
+		                     " c WHERE c.owner=" + OracleMetadataLiteral(owner) + table_scope + filter;
+		return "SELECT x.owner_name,x.table_name,x.item_name,x.expression FROM XMLTABLE('/ROWSET/ROW' "
+		       "PASSING DBMS_XMLGEN.GETXMLTYPE(" +
+		       OracleMetadataLiteral(query) +
+		       ") COLUMNS owner_name VARCHAR2(128) PATH 'OWNER',table_name VARCHAR2(128) PATH 'TABLE_NAME',"
+		       "item_name VARCHAR2(128) PATH '" +
+		       StringUtil::Upper(item) + "',expression CLOB PATH '" + StringUtil::Upper(expression) +
+		       "') x ORDER BY x.table_name,x.item_name";
+	}
+
 	if (category == "columnProperties") {
 		auto identity_join = string();
 		auto identity_generation = string("''");
@@ -534,6 +554,9 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto category = input.inputs[1].GetValue<string>();
 	auto owner = input.inputs[2].GetValue<string>();
+	if ((category == "columnExpressions" || category == "checkExpressions") &&
+	    input.table_function.name != "oracle_relational_metadata_scoped_v2")
+		throw BinderException("Oracle expression metadata requires the scoped v2 contract");
 	vector<string> tables;
 	if (input.inputs.size() == 4) {
 		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
@@ -586,8 +609,10 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	return make_uniq<ODBCQueryBindData>(catalog, std::move(result), std::move(sql));
 }
 
-ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool scoped)
-    : TableFunction(scoped ? "oracle_relational_metadata_scoped_v1" : "oracle_relational_metadata",
+ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool scoped, bool expressions)
+    : TableFunction(expressions ? "oracle_relational_metadata_scoped_v2"
+                    : scoped    ? "oracle_relational_metadata_scoped_v1"
+                                : "oracle_relational_metadata",
                     scoped ? vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
                                                   LogicalType::LIST(LogicalType::VARCHAR)}
                            : vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},

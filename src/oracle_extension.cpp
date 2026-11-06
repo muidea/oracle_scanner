@@ -110,6 +110,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(relational_metadata_function);
 	ODBCRelationalMetadataFunction scoped_relational_metadata_function(true);
 	loader.RegisterFunction(scoped_relational_metadata_function);
+	ODBCRelationalMetadataFunction expression_metadata_function(true, true);
+	loader.RegisterFunction(expression_metadata_function);
 
 	SecretType secret_type;
 	secret_type.name = "oracle";

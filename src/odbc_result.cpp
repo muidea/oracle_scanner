@@ -6,6 +6,9 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "odbc_types.hpp"
+#include "odbc_exact_numeric.hpp"
+#include "duckdb/common/operator/decimal_cast_operators.hpp"
+#include "duckdb/function/cast/default_casts.hpp"
 #include <sql.h>
 #include <sqlext.h>
 #include <cstdint>
@@ -125,9 +128,9 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 	for (SQLSMALLINT i = 0; i < num_cols; i++) {
 		vector<SQLWCHAR> col_name(256);
 		SQLCHAR type_name_buffer[256] = {};
-		SQLSMALLINT name_len, data_type, decimal_digits, nullable;
+		SQLSMALLINT name_len = 0, data_type = 0, decimal_digits = 0, nullable = 0;
 		SQLSMALLINT type_name_len = 0;
-		SQLULEN column_size;
+		SQLULEN column_size = 0;
 		SQLLEN unused_numeric_attribute = 0;
 
 		retcode = SQLDescribeColW(stmt, i + 1, col_name.data(), static_cast<SQLSMALLINT>(col_name.size()), &name_len,
@@ -155,7 +158,7 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		    ODBCTypes::ODBCToLogicalType(type_config, data_type, column_size, decimal_digits, type_name);
 
 		// Create field with placeholder information
-		ODBCField field(nullptr, std::move(ltype), type_config);
+		ODBCField field(nullptr, ltype, type_config);
 		field.name = UTF16UnitsToUTF8(col_name.data(), static_cast<size_t>(name_len));
 		field.type_name = type_name;
 		field.odbc_type = data_type;
@@ -163,6 +166,8 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		auto lower_type_name = StringUtil::Lower(type_name);
 		if (ltype.id() == LogicalTypeId::TIMESTAMP) {
 			field.c_type = SQL_C_TYPE_TIMESTAMP;
+		} else if (ltype.id() == LogicalTypeId::VARCHAR && StringType::GetCollation(ltype) == "oracle_exact_numeric") {
+			field.c_type = SQL_C_CHAR;
 		} else if (ltype.id() == LogicalTypeId::VARCHAR) {
 			// SQLGetData(SQL_C_CHAR) uses the Oracle client's ANSI conversion and
 			// replaces non-ASCII identifiers with '?'. Read text as UTF-16 and
@@ -725,66 +730,43 @@ static void WriteTimeAsString(ODBCField &f, Vector &vec, idx_t row) {
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
+template <class T>
+static void WriteExactDecimal(const string &text, Vector &vec, idx_t row, uint8_t precision, uint8_t scale) {
+	T value;
+	string error;
+	CastParameters parameters(true, &error);
+	if (!TryCastToDecimal::Operation(string_t(text), value, parameters, precision, scale)) {
+		throw ConversionException("ODBC DECIMAL value does not fit the declared precision/scale");
+	}
+	if (ODBCExactNumericKey(text) != ODBCExactNumericKey(Value::DECIMAL(value, precision, scale).ToString())) {
+		throw ConversionException("ODBC DECIMAL value %s cannot be represented exactly as DECIMAL(%d,%d)", text,
+		                          precision, scale);
+	}
+	FlatVector::GetData<T>(vec)[row] = value;
+}
+
 static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
 	if (f.bind_length == SQL_NULL_DATA) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-
-	if (f.bind_length < 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
-		FlatVector::SetNull(vec, row, true);
-		return;
+	if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+		throw ConversionException("ODBC DECIMAL value has an invalid transfer length");
 	}
-
-	string decimal_str(f.ValueData(), static_cast<size_t>(f.bind_length));
-
-	auto &vec_type = vec.GetType();
-	uint8_t precision = DecimalType::GetWidth(vec_type);
-	uint8_t scale = DecimalType::GetScale(vec_type);
-
-	try {
-		size_t dot_pos = decimal_str.find('.');
-		string int_part, frac_part;
-
-		if (dot_pos != string::npos) {
-			int_part = decimal_str.substr(0, dot_pos);
-			frac_part = decimal_str.substr(dot_pos + 1);
-		} else {
-			int_part = decimal_str;
-		}
-
-		if (frac_part.length() < scale) {
-			frac_part.append(scale - frac_part.length(), '0');
-		} else if (frac_part.length() > scale) {
-			frac_part = frac_part.substr(0, scale);
-		}
-
-		string scaled_str = int_part + frac_part;
-
-		// DuckDB DECIMAL internal storage depends on precision:
-		//   1-4   → int16_t
-		//   5-9   → int32_t
-		//   10-18 → int64_t
-		//   19-38 → hugeint_t
-		if (precision <= 4) {
-			FlatVector::GetData<int16_t>(vec)[row] = static_cast<int16_t>(std::stoi(scaled_str));
-		} else if (precision <= 9) {
-			FlatVector::GetData<int32_t>(vec)[row] = static_cast<int32_t>(std::stol(scaled_str));
-		} else if (precision <= 18) {
-			FlatVector::GetData<int64_t>(vec)[row] = std::stoll(scaled_str);
-		} else if (precision <= 38) {
-			hugeint_t huge_val;
-			if (!Hugeint::TryConvert(scaled_str.c_str(), huge_val)) {
-				throw InternalException("Decimal value out of hugeint range: %s", scaled_str.c_str());
-			}
-			FlatVector::GetData<hugeint_t>(vec)[row] = huge_val;
-		} else {
-			throw InternalException("Unsupported DECIMAL precision %u for column %s (max: 38)", precision,
-			                        f.name.c_str());
-		}
-	} catch (const std::exception &e) {
-		throw InternalException("Failed to parse decimal value '%s' for column %s: %s", decimal_str.c_str(),
-		                        f.name.c_str(), e.what());
+	string text(f.ValueData(), static_cast<size_t>(f.bind_length));
+	auto precision = DecimalType::GetWidth(vec.GetType());
+	auto scale = DecimalType::GetScale(vec.GetType());
+	// Oracle may send fixed NUMBER values in scientific notation. Use the
+	// checked DuckDB parser, then verify exact equality so its rounding rules
+	// cannot silently discard any nonzero source digits.
+	if (precision <= 4) {
+		WriteExactDecimal<int16_t>(text, vec, row, precision, scale);
+	} else if (precision <= 9) {
+		WriteExactDecimal<int32_t>(text, vec, row, precision, scale);
+	} else if (precision <= 18) {
+		WriteExactDecimal<int64_t>(text, vec, row, precision, scale);
+	} else {
+		WriteExactDecimal<hugeint_t>(text, vec, row, precision, scale);
 	}
 }
 

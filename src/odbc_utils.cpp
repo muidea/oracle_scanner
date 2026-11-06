@@ -1,3 +1,4 @@
+#include "guarded_odbc_source_error.hpp"
 #include "odbc_utils.hpp"
 
 #include <cstdio>
@@ -118,6 +119,15 @@ string EscapeODBCConnectionValue(const string &value) {
 	return result;
 }
 
+// Oracle's default SQL_FLOAT transfer for unconstrained NUMBER rounds even
+// SQL_C_CHAR to roughly 15 significant digits. BindAsFLOAT=T asks the driver
+// to retain Oracle decimal FLOAT/NUMBER instead of its binary float carrier.
+// Keep this invariant on both DriverConnect and temporary-DSN connections.
+static bool IsOracleNumericOption(const string &key) {
+	auto normalized = StringUtil::Lower(key);
+	return normalized == "bnf" || normalized == "bindasfloat" || normalized == "num" || normalized == "numericsetting";
+}
+
 #ifndef _WIN32
 void WriteODBCIniValue(std::ofstream &file, const string &key, const string &value) {
 	if (value.find_first_of("\r\n") != string::npos) {
@@ -161,8 +171,11 @@ string CreateTemporaryODBCIni(const ODBCConnectionParameters &config, string &ds
 		if (separator == string::npos) {
 			continue;
 		}
-		WriteODBCIniValue(file, extra.substr(0, separator), extra.substr(separator + 1));
+		if (!IsOracleNumericOption(extra.substr(0, separator)))
+			WriteODBCIniValue(file, extra.substr(0, separator), extra.substr(separator + 1));
 	}
+	WriteODBCIniValue(file, "BindAsFLOAT", "T");
+	WriteODBCIniValue(file, "NumericSetting", "US");
 	file.close();
 	if (!file.good()) {
 		std::remove(path.c_str());
@@ -336,9 +349,11 @@ string ODBCUtils::BuildConnectionString(const string &dsn) {
 			connection_string += extra + ";";
 			continue;
 		}
-		connection_string +=
-		    extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
+		if (!IsOracleNumericOption(extra.substr(0, separator)))
+			connection_string +=
+			    extra.substr(0, separator + 1) + EscapeODBCConnectionValue(extra.substr(separator + 1)) + ";";
 	}
+	connection_string += "BNF=T;NUM=US;";
 
 	return connection_string;
 }
@@ -390,18 +405,12 @@ SQLHDBC ODBCUtils::Connect(const string &dsn, SQLHENV &out_env) {
 	}
 
 	if (!SQL_SUCCEEDED(ret)) {
-		SQLCHAR sqlstate[6] = {0};
-		SQLINTEGER native_error = 0;
-		SQLCHAR message_text[SQL_MAX_MESSAGE_LENGTH] = {0};
-		SQLSMALLINT text_length = 0;
-
-		SQLGetDiagRec(SQL_HANDLE_DBC, dbc, 1, sqlstate, &native_error, message_text, SQL_MAX_MESSAGE_LENGTH,
-		              &text_length);
-
+		auto source = ReadGuardedODBCSourceError(SQL_HANDLE_DBC, dbc, "");
 		SQLFreeHandle(SQL_HANDLE_DBC, dbc);
 		SQLFreeHandle(SQL_HANDLE_ENV, env);
-
-		throw IOException("Failed to connect to Oracle through ODBC: %s", (char *)message_text);
+		if (!source.message.empty())
+			throw GuardedODBCConnectionFailure(std::move(source));
+		throw IOException("ODBC connection failed without a source diagnostic");
 	}
 	// This is a driver-level safeguard in addition to the read-only DuckDB catalog.
 	SQLSetConnectAttr(dbc, SQL_ATTR_ACCESS_MODE, (SQLPOINTER)SQL_MODE_READ_ONLY, 0);

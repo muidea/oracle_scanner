@@ -34,11 +34,16 @@ LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, cons
 		return LogicalType::TIMESTAMP;
 	}
 	if (type_name == "number" || type_name == "numeric" || type_name == "decimal" || type_name == "integer") {
-		if (type_info.precision > 0 && type_info.precision <= 38 && type_info.scale >= 0 && type_info.scale <= 38) {
-			auto width = NumericCast<uint8_t>(std::max(type_info.precision, type_info.scale));
-			return LogicalType::DECIMAL(width, NumericCast<uint8_t>(type_info.scale));
+		// NUMBER(p,-s) needs p+s integer digits; NUMBER(p,s>p) needs
+		// scale digits in DuckDB. Unknown/wide descriptors remain exact text.
+		auto width = std::max(type_info.precision, type_info.scale);
+		if (type_info.scale < 0)
+			width = type_info.precision - type_info.scale;
+		if (type_info.precision > 0 && width > 0 && width <= 38 && type_info.scale <= 38) {
+			return LogicalType::DECIMAL(NumericCast<uint8_t>(width),
+			                            NumericCast<uint8_t>(std::max<int64_t>(0, type_info.scale)));
 		}
-		return LogicalType::DOUBLE;
+		return LogicalType::VARCHAR_COLLATION("oracle_exact_numeric");
 	}
 	if (type_name == "binary_float" || type_name == "real") {
 		return LogicalType::FLOAT;
@@ -85,6 +90,14 @@ LogicalType ODBCTypes::FieldToLogicalType(const ODBCTypeConfig &type_config, SQL
 	type_data.type_name = StringUtil::Lower(reported_type_name);
 	type_data.precision = col_size > 0 ? NumericCast<int64_t>(col_size) : -1;
 	type_data.scale = decimal_digits;
+
+	// Oracle describes unconstrained NUMBER as SQL_FLOAT with a placeholder
+	// precision/scale (often 38,0). It is decimal source data, not IEEE float,
+	// and that placeholder cannot establish a fixed DECIMAL scale.
+	if ((type_data.type_name == "number" || type_data.type_name == "numeric" || type_data.type_name == "decimal") &&
+	    (data_type == SQL_FLOAT || data_type == SQL_DOUBLE || data_type == SQL_REAL)) {
+		return LogicalType::VARCHAR_COLLATION("oracle_exact_numeric");
+	}
 
 	if (!type_data.type_name.empty()) {
 		type_data.column_type = type_data.type_name;

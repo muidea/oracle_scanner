@@ -54,6 +54,13 @@ TableFunction ODBCTableEntry::GetScanFunction(ClientContext &context, unique_ptr
 	if (context.TryGetCurrentSetting("oracle_experimental_filter_pushdown", filter_pushdown)) {
 		function.filter_pushdown = BooleanValue::Get(filter_pushdown);
 	}
+	for (const auto &column : columns.Logical()) {
+		if (column.GetType().id() == LogicalTypeId::VARCHAR &&
+		    StringType::GetCollation(column.GetType()) == "oracle_exact_numeric") {
+			function.filter_pushdown = false;
+			break;
+		}
+	}
 	return function;
 }
 

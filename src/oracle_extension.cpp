@@ -1,5 +1,6 @@
 #define DUCKDB_BUILD_LOADABLE_EXTENSION
 #include "duckdb.hpp"
+#include "odbc_exact_numeric.hpp"
 
 #include "odbc_scanner.hpp"
 #include "odbc_storage.hpp"
@@ -91,6 +92,7 @@ void SetOracleSecretParameters(CreateSecretFunction &function) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	RegisterODBCExactNumericCollation(loader, "oracle_exact_numeric");
 #ifdef ORACLE_GUARDED_CRUD
 	RegisterOracleGuardedCRUD(loader);
 #endif

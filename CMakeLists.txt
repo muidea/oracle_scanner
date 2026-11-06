@@ -46,3 +46,16 @@ endif()
 # Link libraries
 target_link_libraries(${TARGET_NAME}_loadable_extension 
                       ${ODBC_LIBRARY})
+
+option(SCANNER_BUILD_CAPABILITY_TESTS "Build scanner capability contract tests" OFF)
+if(SCANNER_BUILD_CAPABILITY_TESTS)
+    add_executable(guarded_odbc_source_error_test test/guarded_odbc_source_error_test.cpp)
+    target_include_directories(guarded_odbc_source_error_test PRIVATE src/include)
+    target_link_libraries(guarded_odbc_source_error_test duckdb)
+    add_test(NAME guarded_odbc_source_errors COMMAND guarded_odbc_source_error_test)
+    add_executable(odbc_exact_numeric_test test/odbc_exact_numeric_test.cpp src/odbc_types.cpp)
+    target_include_directories(odbc_exact_numeric_test PRIVATE src/include)
+    target_link_libraries(odbc_exact_numeric_test duckdb)
+    add_test(NAME odbc_exact_numeric COMMAND odbc_exact_numeric_test)
+    target_compile_definitions(odbc_exact_numeric_test PRIVATE EXACT_NUMERIC_ORACLE)
+endif()

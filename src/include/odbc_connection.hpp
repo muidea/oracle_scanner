@@ -59,6 +59,8 @@ struct OwnedODBCConnection {
 struct ODBCQueryMetrics {
 	int64_t execute_ms = 0;
 	int64_t materialize_ms = 0;
+	int64_t fetch_us = 0, get_data_us = 0, convert_us = 0;
+	uint64_t fetch_calls = 0, get_data_calls = 0, rows = 0, value_bytes = 0;
 };
 
 class ODBCConnection : public enable_shared_from_this<ODBCConnection> {

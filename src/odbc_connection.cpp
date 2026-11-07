@@ -318,7 +318,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	auto materialize_started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	try {
 		auto result = make_uniq<ODBCResult>(query, ODBCStatementPtr(hstmt, ODBCStatementDelete), type_config,
-		                                    affected_rows, num_cols, shared_from_this(), streaming);
+		                                    affected_rows, num_cols, shared_from_this(), streaming, metrics);
 		if (metrics)
 			metrics->materialize_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
 			                               std::chrono::steady_clock::now() - materialize_started)

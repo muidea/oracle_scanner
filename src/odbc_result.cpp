@@ -20,6 +20,7 @@
 #include <thread>
 #include <codecvt>
 #include <locale>
+#include <chrono>
 
 namespace duckdb {
 
@@ -225,7 +226,34 @@ static bool IsVariableWidthCType(SQLSMALLINT c_type) {
 	return c_type == SQL_C_CHAR || c_type == SQL_C_WCHAR || c_type == SQL_C_BINARY;
 }
 
-static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query) {
+// Stack-only timers include failed driver calls and never alter query results.
+class ODBCPhaseTimer {
+public:
+	explicit ODBCPhaseTimer(int64_t *elapsed_p) : elapsed(elapsed_p) {
+		if (elapsed)
+			started = std::chrono::steady_clock::now();
+	}
+	~ODBCPhaseTimer() {
+		if (elapsed)
+			*elapsed +=
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
+			        .count();
+	}
+
+private:
+	int64_t *elapsed;
+	std::chrono::steady_clock::time_point started;
+};
+
+static SQLRETURN MeasuredGetData(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLINT type, SQLPOINTER data, SQLLEN capacity,
+                                 SQLLEN *length, ODBCQueryMetrics *metrics) {
+	ODBCPhaseTimer timer(metrics ? &metrics->get_data_us : nullptr);
+	if (metrics)
+		metrics->get_data_calls++;
+	return SQLGetData(stmt, column, type, data, capacity, length);
+}
+
+static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query, ODBCQueryMetrics *metrics) {
 	static constexpr size_t CHUNK_SIZE = 8192;
 	static constexpr size_t MAX_VALUE_SIZE = MAX_BIND_BUFFER_SIZE * 16;
 	vector<char> buffer(CHUNK_SIZE);
@@ -238,8 +266,9 @@ static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const stri
 		if (!IsVariableWidthCType(field.c_type)) {
 			memset(field.bind_buffer.data(), 0, field.bind_buffer.size());
 			SQLLEN indicator = 0;
-			auto retcode = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, field.bind_buffer.data(),
-			                          static_cast<SQLLEN>(field.bind_buffer.size()), &indicator);
+			auto retcode =
+			    MeasuredGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, field.bind_buffer.data(),
+			                    static_cast<SQLLEN>(field.bind_buffer.size()), &indicator, metrics);
 			if (indicator == SQL_NULL_DATA) {
 				field.bind_length = SQL_NULL_DATA;
 				continue;
@@ -253,8 +282,8 @@ static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const stri
 		while (true) {
 			memset(buffer.data(), 0, buffer.size());
 			SQLLEN indicator = 0;
-			auto retcode = SQLGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, buffer.data(),
-			                          static_cast<SQLLEN>(buffer.size()), &indicator);
+			auto retcode = MeasuredGetData(stmt, static_cast<SQLUSMALLINT>(i + 1), field.c_type, buffer.data(),
+			                               static_cast<SQLLEN>(buffer.size()), &indicator, metrics);
 			if (indicator == SQL_NULL_DATA) {
 				field.bind_length = SQL_NULL_DATA;
 				field.value_buffer.clear();
@@ -309,15 +338,18 @@ static vector<LogicalType> CreateChunkTypes(vector<ODBCField> &fields, const ODB
 
 ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p,
                        idx_t affected_rows_p, SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
-                       ODBCResultStreaming streaming_p)
+                       ODBCResultStreaming streaming_p, ODBCQueryMetrics *metrics_p)
     : query(query_p), stmt(std::move(stmt_p)), type_config(std::move(type_config_p)), affected_rows(affected_rows_p),
-      connection(std::move(connection_p)), is_streaming(streaming_p == ODBCResultStreaming::ALLOW_STREAMING) {
+      connection(std::move(connection_p)),
+      metrics(streaming_p == ODBCResultStreaming::FORCE_MATERIALIZATION ? metrics_p : nullptr),
+      is_streaming(streaming_p == ODBCResultStreaming::ALLOW_STREAMING) {
 
 	if (!stmt) {
 		throw InternalException("ODBCResult: Statement handle is null for query \"%s\"\n", query_p.c_str());
 	}
 
 	if (affected_rows != static_cast<idx_t>(-1)) {
+		metrics = nullptr;
 		stmt.reset();
 		if (connection && !connection_released) {
 			connection->ReleaseConnection();
@@ -365,6 +397,7 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 		}
 		throw;
 	}
+	metrics = nullptr;
 }
 
 void ODBCResult::ReadAllData() {
@@ -471,9 +504,9 @@ void ODBCResult::HandleTruncatedData() {
 			}
 
 			SQLLEN remaining_len = 0;
-			SQLRETURN retcode =
-			    SQLGetData(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.value_buffer.data() + already_have,
-			               static_cast<SQLLEN>(f.value_buffer.size() - already_have), &remaining_len);
+			SQLRETURN retcode = MeasuredGetData(
+			    stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.value_buffer.data() + already_have,
+			    static_cast<SQLLEN>(f.value_buffer.size() - already_have), &remaining_len, metrics);
 
 			if (SQL_SUCCEEDED(retcode) && original_length > 0) {
 				f.bind_length = MinValue<SQLLEN>(original_length, static_cast<SQLLEN>(total_len));
@@ -547,7 +580,13 @@ bool ODBCResult::FetchNext() {
 		f.ResetBind();
 	}
 
-	SQLRETURN retcode = SQLFetch(stmt.get());
+	SQLRETURN retcode;
+	{
+		ODBCPhaseTimer timer(metrics ? &metrics->fetch_us : nullptr);
+		if (metrics)
+			metrics->fetch_calls++;
+		retcode = SQLFetch(stmt.get());
+	}
 
 	if (retcode == SQL_ERROR) {
 		// 获取详细的ODBC错误信息
@@ -568,7 +607,7 @@ bool ODBCResult::FetchNext() {
 		return false;
 	}
 
-	ReadUnboundData(fields, stmt.get(), query);
+	ReadUnboundData(fields, stmt.get(), query, metrics);
 	HandleTruncatedData();
 
 	for (size_t i = 0; i < fields.size(); i++) {
@@ -576,6 +615,13 @@ bool ODBCResult::FetchNext() {
 	}
 
 	bool result = (retcode == SQL_SUCCESS || retcode == SQL_SUCCESS_WITH_INFO);
+	if (metrics && result) {
+		metrics->rows++;
+		for (const auto &field : fields) {
+			if (field.bind_length > 0)
+				metrics->value_bytes += static_cast<uint64_t>(field.bind_length);
+		}
+	}
 	return result;
 }
 
@@ -920,6 +966,7 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 }
 
 void ODBCResult::WriteToChunk(DataChunk &chunk, idx_t row) {
+	ODBCPhaseTimer timer(metrics ? &metrics->convert_us : nullptr);
 	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 		if (col >= fields.size()) {
 			throw InternalException("Column index out of bounds in WriteToChunk");

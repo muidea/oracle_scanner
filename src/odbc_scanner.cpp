@@ -474,10 +474,12 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 		       check_expression +
 		       " AS check_definition,c.generated AS generated_name,NVL(c.index_owner,'') AS index_owner,NVL(c."
 		       "index_name,'') AS index_name FROM all_constraints c LEFT JOIN all_cons_columns cc ON cc.owner=c.owner "
-		       "AND cc.constraint_name=c.constraint_name AND cc.position IS NOT NULL LEFT JOIN all_constraints rc ON "
+		       "AND cc.constraint_name=c.constraint_name AND cc.table_name=c.table_name AND cc.position IS NOT NULL "
+		       "LEFT JOIN all_constraints rc ON "
 		       "rc.owner=c.r_owner AND rc."
 		       "constraint_name=c.r_constraint_name LEFT JOIN all_cons_columns rcc ON rcc.owner=rc.owner AND rcc."
-		       "constraint_name=rc.constraint_name AND rcc.position=cc.position AND rcc.position IS NOT NULL WHERE "
+		       "constraint_name=rc.constraint_name AND rcc.table_name=rc.table_name AND rcc.position=cc.position AND "
+		       "rcc.position IS NOT NULL WHERE "
 		       "c.owner=" +
 		       OracleMetadataLiteral(owner) + table_scope +
 		       " AND c.constraint_type IN ('P','U','R','C') ORDER BY "
@@ -569,15 +571,22 @@ struct OracleMetadataPhases {
 				v = StringUtil::Replace(v, "\n", "\\n");
 				return StringUtil::Replace(v, "\r", "\\r");
 			};
-			std::fprintf(stderr,
-			             "oracle metadata native phases catalog=\"%s\" owner=\"%s\" category=\"%s\" target_count=%llu "
-			             "probe_sql_count=%d category_sql_count=%d probe_execute_ms=%lld probe_materialize_ms=%lld "
-			             "category_execute_ms=%lld category_materialize_ms=%lld total_ms=%lld result=%s\n",
-			             quote(catalog).c_str(), quote(owner).c_str(), quote(category).c_str(),
-			             static_cast<unsigned long long>(tables), probe_calls, category_calls,
-			             static_cast<long long>(probe.execute_ms), static_cast<long long>(probe.materialize_ms),
-			             static_cast<long long>(query.execute_ms), static_cast<long long>(query.materialize_ms),
-			             static_cast<long long>(elapsed), success ? "success" : "failed");
+			std::fprintf(
+			    stderr,
+			    "oracle metadata native phases catalog=\"%s\" owner=\"%s\" category=\"%s\" target_count=%llu "
+			    "probe_sql_count=%d category_sql_count=%d probe_execute_ms=%lld probe_materialize_ms=%lld "
+			    "category_execute_ms=%lld category_materialize_ms=%lld category_fetch_calls=%llu "
+			    "category_get_data_calls=%llu category_rows=%llu category_value_bytes=%llu category_fetch_us=%lld "
+			    "category_get_data_us=%lld category_convert_us=%lld total_ms=%lld result=%s\n",
+			    quote(catalog).c_str(), quote(owner).c_str(), quote(category).c_str(),
+			    static_cast<unsigned long long>(tables), probe_calls, category_calls,
+			    static_cast<long long>(probe.execute_ms), static_cast<long long>(probe.materialize_ms),
+			    static_cast<long long>(query.execute_ms), static_cast<long long>(query.materialize_ms),
+			    static_cast<unsigned long long>(query.fetch_calls),
+			    static_cast<unsigned long long>(query.get_data_calls), static_cast<unsigned long long>(query.rows),
+			    static_cast<unsigned long long>(query.value_bytes), static_cast<long long>(query.fetch_us),
+			    static_cast<long long>(query.get_data_us), static_cast<long long>(query.convert_us),
+			    static_cast<long long>(elapsed), success ? "success" : "failed");
 		} catch (...) { /* Diagnostics must never change source execution. */
 		}
 	}

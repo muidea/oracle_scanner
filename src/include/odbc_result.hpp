@@ -14,6 +14,7 @@
 
 namespace duckdb {
 class ODBCConnection;
+struct ODBCQueryMetrics;
 struct OwnedODBCConnection;
 
 struct ODBCField {
@@ -48,7 +49,8 @@ class ODBCResult {
 public:
 	ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBCTypeConfig type_config_p, idx_t affected_rows_p,
 	           SQLSMALLINT num_cols_p, shared_ptr<ODBCConnection> connection_p,
-	           ODBCResultStreaming streaming_p = ODBCResultStreaming::FORCE_MATERIALIZATION);
+	           ODBCResultStreaming streaming_p = ODBCResultStreaming::FORCE_MATERIALIZATION,
+	           ODBCQueryMetrics *metrics_p = nullptr);
 	~ODBCResult();
 
 	string GetString(idx_t col);
@@ -78,6 +80,8 @@ private:
 	idx_t row_idx = static_cast<idx_t>(-1);
 	bool connection_released = false;
 
+	// Only borrowed during constructor-owned materialization; never escapes bind.
+	ODBCQueryMetrics *metrics = nullptr;
 	bool is_streaming = false;
 	bool stream_exhausted = false;
 

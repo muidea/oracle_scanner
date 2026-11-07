@@ -1,3 +1,4 @@
+#include <chrono>
 #include "odbc_connection.hpp"
 
 #include "duckdb/common/helper.hpp"
@@ -218,7 +219,8 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 
 unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector<Value> params,
                                                      ODBCResultStreaming streaming,
-                                                     ODBCConnectorInterface con_interface, uint32_t timeout_seconds) {
+                                                     ODBCConnectorInterface con_interface, uint32_t timeout_seconds,
+                                                     ODBCQueryMetrics *metrics) {
 
 	// 检查连接是否繁忙
 	bool expected = false;
@@ -279,9 +281,18 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	}
 
 	idx_t affected_rows = 0;
+	auto execute_started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	try {
 		affected_rows = ODBCExecute(hstmt, query, params, result_streaming, timeout_seconds);
+		if (metrics)
+			metrics->execute_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+			                           std::chrono::steady_clock::now() - execute_started)
+			                           .count();
 	} catch (const std::exception &) {
+		if (metrics)
+			metrics->execute_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+			                           std::chrono::steady_clock::now() - execute_started)
+			                           .count();
 		// 执行失败，清理语句句柄
 		if (hstmt != SQL_NULL_HSTMT) {
 			SQLFreeHandle(SQL_HANDLE_STMT, hstmt);
@@ -304,11 +315,20 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		retcode = SQLNumResultCols(hstmt, &num_cols);
 	}
 
+	auto materialize_started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	try {
 		auto result = make_uniq<ODBCResult>(query, ODBCStatementPtr(hstmt, ODBCStatementDelete), type_config,
 		                                    affected_rows, num_cols, shared_from_this(), streaming);
+		if (metrics)
+			metrics->materialize_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+			                               std::chrono::steady_clock::now() - materialize_started)
+			                               .count();
 		return result;
 	} catch (const std::exception &e) {
+		if (metrics)
+			metrics->materialize_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
+			                               std::chrono::steady_clock::now() - materialize_started)
+			                               .count();
 		// ODBCStatementPtr already owns and releases hstmt if construction
 		// fails. Freeing the raw handle here would be a double free.
 		// 释放连接忙状态
@@ -326,12 +346,12 @@ unique_ptr<ODBCResult> ODBCConnection::Query(const string &query, vector<Value> 
 }
 
 unique_ptr<ODBCResult> ODBCConnection::QueryWithTimeout(const string &query, ODBCResultStreaming streaming,
-                                                        uint32_t timeout_seconds) {
+                                                        uint32_t timeout_seconds, ODBCQueryMetrics *metrics) {
 	if (timeout_seconds == 0) {
 		throw InvalidInputException("ODBC query timeout must be greater than zero");
 	}
-	return QueryInternal(query, vector<Value>(), streaming, ODBCConnectorInterface::PREPARED_STATEMENT,
-	                     timeout_seconds);
+	return QueryInternal(query, vector<Value>(), streaming, ODBCConnectorInterface::PREPARED_STATEMENT, timeout_seconds,
+	                     metrics);
 }
 
 void ODBCConnection::Execute(const string &query) {

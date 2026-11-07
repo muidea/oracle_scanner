@@ -55,6 +55,12 @@ struct OwnedODBCConnection {
 	SQLHENV environment;
 };
 
+// Optional statement-local diagnostics; never a shared cache or connection state.
+struct ODBCQueryMetrics {
+	int64_t execute_ms = 0;
+	int64_t materialize_ms = 0;
+};
+
 class ODBCConnection : public enable_shared_from_this<ODBCConnection> {
 public:
 	explicit ODBCConnection(shared_ptr<OwnedODBCConnection> connection, const std::string &dsn_p,
@@ -74,7 +80,7 @@ public:
 	unique_ptr<ODBCResult> Query(const string &query, ODBCResultStreaming streaming);
 	unique_ptr<ODBCResult> Query(const string &query, vector<Value> params, ODBCResultStreaming streaming);
 	unique_ptr<ODBCResult> QueryWithTimeout(const string &query, ODBCResultStreaming streaming,
-	                                        uint32_t timeout_seconds);
+	                                        uint32_t timeout_seconds, ODBCQueryMetrics *metrics = nullptr);
 
 	bool IsOpen();
 	void Close();
@@ -101,7 +107,8 @@ public:
 
 private:
 	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,
-	                                     ODBCConnectorInterface con_interface, uint32_t timeout_seconds = 0);
+	                                     ODBCConnectorInterface con_interface, uint32_t timeout_seconds = 0,
+	                                     ODBCQueryMetrics *metrics = nullptr);
 	idx_t ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming,
 	                  uint32_t timeout_seconds = 0);
 

@@ -12,6 +12,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include <chrono>
+#include <cstdio>
 #include <thread>
 #include <mutex>
 #include <unordered_map>
@@ -386,9 +387,10 @@ static idx_t OracleCapabilityCount(string value, const string &name) {
 	return result;
 }
 
-static OracleRelationalCapabilities ProbeOracleRelationalCapabilities(ODBCConnection &connection) {
+static OracleRelationalCapabilities ProbeOracleRelationalCapabilities(ODBCConnection &connection,
+                                                                      ODBCQueryMetrics *metrics = nullptr) {
 	auto result = connection.QueryWithTimeout(OracleCapabilitySQL(), ODBCResultStreaming::FORCE_MATERIALIZATION,
-	                                          ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS);
+	                                          ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS, metrics);
 	if (result->Fields().size() != 4 || !result->Next()) {
 		throw InvalidInputException("Unexpected Oracle relational metadata capability result");
 	}
@@ -544,6 +546,43 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 	throw InvalidInputException("Unsupported oracle_relational_metadata category \"%s\"", category);
 }
 
+// Per-call measurements distinguish source SQL from DuckDB function calls.
+// Materialization includes field decoding/fetch, not Go result consumption.
+struct OracleMetadataPhases {
+	OracleMetadataPhases(const string &catalog_p, const string &owner_p, const string &category_p, idx_t tables_p)
+	    : catalog(catalog_p), owner(owner_p), category(category_p), tables(tables_p) {
+	}
+	string catalog, owner, category;
+	idx_t tables;
+	ODBCQueryMetrics probe, query;
+	int probe_calls = 0, category_calls = 0;
+	bool success = false;
+	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+	~OracleMetadataPhases() noexcept {
+		try {
+			auto elapsed =
+			    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started)
+			        .count();
+			auto quote = [](string v) {
+				v = StringUtil::Replace(v, "\\", "\\\\");
+				v = StringUtil::Replace(v, "\"", "\\\"");
+				v = StringUtil::Replace(v, "\n", "\\n");
+				return StringUtil::Replace(v, "\r", "\\r");
+			};
+			std::fprintf(stderr,
+			             "oracle metadata native phases catalog=\"%s\" owner=\"%s\" category=\"%s\" target_count=%llu "
+			             "probe_sql_count=%d category_sql_count=%d probe_execute_ms=%lld probe_materialize_ms=%lld "
+			             "category_execute_ms=%lld category_materialize_ms=%lld total_ms=%lld result=%s\n",
+			             quote(catalog).c_str(), quote(owner).c_str(), quote(category).c_str(),
+			             static_cast<unsigned long long>(tables), probe_calls, category_calls,
+			             static_cast<long long>(probe.execute_ms), static_cast<long long>(probe.materialize_ms),
+			             static_cast<long long>(query.execute_ms), static_cast<long long>(query.materialize_ms),
+			             static_cast<long long>(elapsed), success ? "success" : "failed");
+		} catch (...) { /* Diagnostics must never change source execution. */
+		}
+	}
+};
+
 static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &context, TableFunctionBindInput &input,
                                                            vector<LogicalType> &return_types, vector<string> &names) {
 	for (auto &value : input.inputs) {
@@ -590,15 +629,21 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 		throw IOException("Oracle relational metadata admission timed out for catalog \"%s\"", db_name);
 	}
 	auto &connection = ODBCTransaction::Get(context, catalog).GetConnection();
+	OracleMetadataPhases phases {db_name, owner, category, tables.size()};
 	string sql;
 	if (category == "capabilities") {
 		sql = OracleCapabilitySQL();
+		phases.probe_calls++;
 	} else {
-		auto capabilities = ProbeOracleRelationalCapabilities(connection);
+		phases.probe_calls++;
+		auto capabilities = ProbeOracleRelationalCapabilities(connection, &phases.probe);
 		sql = OracleRelationalMetadataSQL(category, owner, capabilities, tables);
 	}
+	if (category != "capabilities")
+		phases.category_calls++;
 	auto result = connection.QueryWithTimeout(sql, ODBCResultStreaming::FORCE_MATERIALIZATION,
-	                                          ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS);
+	                                          ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS,
+	                                          category == "capabilities" ? &phases.probe : &phases.query);
 	for (auto &field : result->Fields()) {
 		names.push_back(field.name);
 		return_types.push_back(field.duckdb_type);
@@ -606,7 +651,9 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	if (return_types.empty()) {
 		throw InvalidInputException("oracle_relational_metadata returned no columns for category \"%s\"", category);
 	}
-	return make_uniq<ODBCQueryBindData>(catalog, std::move(result), std::move(sql));
+	unique_ptr<FunctionData> binding = make_uniq<ODBCQueryBindData>(catalog, std::move(result), std::move(sql));
+	phases.success = true;
+	return binding;
 }
 
 ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool scoped, bool expressions)

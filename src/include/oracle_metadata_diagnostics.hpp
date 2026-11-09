@@ -67,6 +67,14 @@ struct OracleMetadataPhases {
 			    "category_direct_calls=%llu category_prepare_calls=%llu category_parameter_calls=%llu "
 			    "category_bind_calls=%llu category_execute_calls=%llu "
 			    "probe_direct_us=%lld probe_direct_calls=%llu sql_fingerprint=\"%s\" category_sql=\"%s\" total_ms=%lld "
+			    "driver_name=\"%s\" driver_version=\"%s\" driver_name_rc=%d driver_version_rc=%d "
+			    "row_array_size=%lld row_array_rc=%d cursor_type=%lld cursor_type_rc=%d query_timeout=%lld "
+			    "query_timeout_rc=%d "
+			    "configured_fetch_buffer=\"%s\" effective_driver_prefetch=unknown "
+			    "query_lock_wait_us=%lld statement_alloc_us=%lld statement_scope_us=%lld diagnostic_us=%lld "
+			    "fields=%llu unbound_fields=%llu long_fields=%llu lob_fields=%llu "
+			    "first_fetch_us=%lld max_fetch_us=%lld fetch_ge_1ms=%llu fetch_ge_10ms=%llu fetch_ge_100ms=%llu "
+			    "fetch_info=%llu "
 			    "result=%s\n",
 			    quote(catalog).c_str(), quote(owner).c_str(), quote(category).c_str(),
 			    static_cast<unsigned long long>(tables), probe_calls, category_calls,
@@ -88,7 +96,20 @@ struct OracleMetadataPhases {
 			    static_cast<unsigned long long>(query.bind_calls), static_cast<unsigned long long>(query.execute_calls),
 			    static_cast<long long>(probe.direct_us), static_cast<unsigned long long>(probe.direct_calls),
 			    quote(sql_fingerprint).c_str(), quote(sql).c_str(), static_cast<long long>(elapsed),
-			    success ? "success" : "failed");
+			    quote(query.driver_name).c_str(), quote(query.driver_version).c_str(), query.driver_name_rc,
+			    query.driver_version_rc, static_cast<long long>(query.row_array_size), query.row_array_rc,
+			    static_cast<long long>(query.cursor_type), query.cursor_type_rc,
+			    static_cast<long long>(query.query_timeout), query.query_timeout_rc,
+			    quote(query.configured_fetch_buffer).c_str(), static_cast<long long>(query.query_lock_wait_us),
+			    static_cast<long long>(query.statement_alloc_us), static_cast<long long>(query.statement_scope_us),
+			    static_cast<long long>(query.diagnostic_us), static_cast<unsigned long long>(query.fields),
+			    static_cast<unsigned long long>(query.unbound_fields),
+			    static_cast<unsigned long long>(query.long_fields), static_cast<unsigned long long>(query.lob_fields),
+			    static_cast<long long>(query.first_fetch_us), static_cast<long long>(query.max_fetch_us),
+			    static_cast<unsigned long long>(query.fetch_ge_1ms),
+			    static_cast<unsigned long long>(query.fetch_ge_10ms),
+			    static_cast<unsigned long long>(query.fetch_ge_100ms),
+			    static_cast<unsigned long long>(query.fetch_info), success ? "success" : "failed");
 		} catch (...) { /* Diagnostics must never change source execution. */
 		}
 	}

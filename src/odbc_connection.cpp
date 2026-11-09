@@ -226,6 +226,50 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	return affected_rows >= 0 ? static_cast<idx_t>(affected_rows) : static_cast<idx_t>(-1);
 }
 
+// Observe only standard ODBC attributes; do not set driver options or guess
+// Oracle-private attribute numbers. A DSN's FBS is configuration evidence,
+// not proof of the driver's effective internal prefetch window.
+static void ObserveMetadataDriver(SQLHDBC dbc, SQLHSTMT stmt, const string &dsn, ODBCQueryMetrics *metrics) noexcept {
+	if (!metrics)
+		return;
+	ODBCExecuteTimer timer(&metrics->diagnostic_us);
+	try {
+		auto info = [&](SQLUSMALLINT key, string &value, int &rc) {
+			SQLCHAR buffer[256] = {};
+			SQLSMALLINT length = 0;
+			rc = SQLGetInfo(dbc, key, buffer, sizeof(buffer), &length);
+			if (SQL_SUCCEEDED(rc) && length >= 0)
+				value.assign(reinterpret_cast<const char *>(buffer),
+				             std::min<size_t>(static_cast<size_t>(length), sizeof(buffer) - 1));
+		};
+		info(SQL_DRIVER_NAME, metrics->driver_name, metrics->driver_name_rc);
+		info(SQL_DRIVER_VER, metrics->driver_version, metrics->driver_version_rc);
+		auto attr = [&](SQLINTEGER key, int64_t &value, int &rc) {
+			SQLULEN actual = 0;
+			rc = SQLGetStmtAttr(stmt, key, &actual, sizeof(actual), nullptr);
+			if (SQL_SUCCEEDED(rc))
+				value = static_cast<int64_t>(actual);
+		};
+		attr(SQL_ATTR_ROW_ARRAY_SIZE, metrics->row_array_size, metrics->row_array_rc);
+		attr(SQL_ATTR_CURSOR_TYPE, metrics->cursor_type, metrics->cursor_type_rc);
+		attr(SQL_ATTR_QUERY_TIMEOUT, metrics->query_timeout, metrics->query_timeout_rc);
+		ODBCConnectionParameters config;
+		unordered_set<string> options;
+		std::tie(config, options) = ODBCUtils::ParseConnectionParameters(dsn);
+		for (auto &param : config.extra_params) {
+			auto equal = param.find('=');
+			if (equal == string::npos)
+				continue;
+			auto key = StringUtil::Lower(param.substr(0, equal));
+			auto value = param.substr(equal + 1);
+			if ((key == "fbs" || key == "fetchbuffersize") && !value.empty() &&
+			    value.find_first_not_of("0123456789") == string::npos)
+				metrics->configured_fetch_buffer = value;
+		}
+	} catch (...) { /* Observability must not change source execution. */
+	}
+}
+
 unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector<Value> params,
                                                      ODBCResultStreaming streaming,
                                                      ODBCConnectorInterface con_interface, uint32_t timeout_seconds,
@@ -248,7 +292,12 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 
 	// 使用递归互斥锁保护连接操作，防止多个查询同时使用同一个连接
 	// 使用 recursive_mutex 允许同一线程重入，避免死锁
+	auto lock_started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	lock_guard<std::recursive_mutex> l(query_lock);
+	if (metrics)
+		metrics->query_lock_wait_us +=
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - lock_started)
+		        .count();
 
 	auto hdbc = GetConn();
 	auto query_sequence = ++connection->query_sequence;
@@ -287,7 +336,13 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	}
 
 	SQLHSTMT hstmt = SQL_NULL_HSTMT;
+	ODBCExecuteTimer statement_timer(metrics ? &metrics->statement_scope_us : nullptr);
+	auto alloc_started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	SQLRETURN retcode = SQLAllocHandle(SQL_HANDLE_STMT, hdbc, &hstmt);
+	if (metrics)
+		metrics->statement_alloc_us +=
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - alloc_started)
+		        .count();
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 释放连接忙状态
 		ReleaseConnection();
@@ -315,6 +370,8 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 		ReleaseConnection();
 		throw;
 	}
+
+	ObserveMetadataDriver(hdbc, hstmt, dsn, metrics);
 
 	// Get number of result columns
 	SQLSMALLINT num_cols = 0;

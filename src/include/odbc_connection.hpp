@@ -69,6 +69,27 @@ struct ODBCQueryMetrics {
 	int64_t direct_us = 0, prepare_us = 0, parameter_us = 0, bind_us = 0, execute_us = 0, result_info_us = 0;
 	uint64_t direct_calls = 0, prepare_calls = 0, parameter_calls = 0, bind_calls = 0, execute_calls = 0;
 	uint64_t connection_id = 0, connection_query_sequence = 0;
+	string driver_name, driver_version, configured_fetch_buffer;
+	// -1 means not observed; never present unsupported attributes as zero.
+	int driver_name_rc = -1, driver_version_rc = -1;
+	int row_array_rc = -1, cursor_type_rc = -1, query_timeout_rc = -1;
+	int64_t row_array_size = -1, cursor_type = -1, query_timeout = -1;
+	int64_t query_lock_wait_us = 0, statement_alloc_us = 0, statement_scope_us = 0, diagnostic_us = 0;
+	uint64_t fields = 0, unbound_fields = 0, long_fields = 0, lob_fields = 0;
+	int64_t first_fetch_us = 0, max_fetch_us = 0;
+	uint64_t fetch_ge_1ms = 0, fetch_ge_10ms = 0, fetch_ge_100ms = 0, fetch_info = 0;
+
+	void RecordFetch(int64_t elapsed, SQLRETURN rc) noexcept {
+		fetch_us += elapsed;
+		if (fetch_calls++ == 0)
+			first_fetch_us = elapsed;
+		if (elapsed > max_fetch_us)
+			max_fetch_us = elapsed;
+		fetch_ge_1ms += elapsed >= 1000;
+		fetch_ge_10ms += elapsed >= 10000;
+		fetch_ge_100ms += elapsed >= 100000;
+		fetch_info += rc == SQL_SUCCESS_WITH_INFO;
+	}
 };
 
 class ODBCConnection : public enable_shared_from_this<ODBCConnection> {

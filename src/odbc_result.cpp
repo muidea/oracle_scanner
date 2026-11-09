@@ -380,6 +380,19 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 
 		if (!fields.empty()) {
 			InitBinds(fields, stmt.get());
+			if (metrics)
+				try {
+					metrics->fields = fields.size();
+					for (const auto &field : fields) {
+						metrics->unbound_fields += !field.column_bound;
+						metrics->long_fields += field.odbc_type == SQL_LONGVARCHAR ||
+						                        field.odbc_type == SQL_WLONGVARCHAR ||
+						                        field.odbc_type == SQL_LONGVARBINARY;
+						auto name = StringUtil::Lower(field.type_name);
+						metrics->lob_fields += name == "clob" || name == "nclob" || name == "blob" || name == "bfile";
+					}
+				} catch (...) { /* Diagnostic allocation failure must not change query results. */
+				}
 			auto ltypes = CreateChunkTypes(fields, type_config);
 			this->data_chunk.Initialize(Allocator::DefaultAllocator(), ltypes);
 
@@ -595,10 +608,13 @@ bool ODBCResult::FetchNext() {
 
 	SQLRETURN retcode;
 	{
-		ODBCPhaseTimer timer(metrics ? &metrics->fetch_us : nullptr);
-		if (metrics)
-			metrics->fetch_calls++;
+		auto started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 		retcode = SQLFetch(stmt.get());
+		if (metrics)
+			metrics->RecordFetch(
+			    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
+			        .count(),
+			    retcode);
 	}
 
 	if (retcode == SQL_ERROR) {

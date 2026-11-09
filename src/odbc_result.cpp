@@ -1,3 +1,4 @@
+#include "query_odbc_source_error.hpp"
 #include "include/odbc_result.hpp"
 #include "odbc_connection.hpp"
 #include "storage/odbc_connection_pool.hpp"
@@ -116,12 +117,16 @@ size_t ODBCField::ValueBufferSize() const {
 	return value_buffer.empty() ? bind_buffer.size() : value_buffer.size();
 }
 
-static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, const ODBCTypeConfig &type_config) {
+static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, const ODBCTypeConfig &type_config,
+                                    SQLHDBC source_connection) {
 	vector<ODBCField> fields;
 	SQLSMALLINT num_cols;
 	SQLRETURN retcode = SQLNumResultCols(stmt, &num_cols);
 
-	if (!SQL_SUCCEEDED(retcode) || num_cols == 0) {
+	if (!SQL_SUCCEEDED(retcode)) {
+		ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, source_connection, "source_describe", query);
+	}
+	if (num_cols == 0) {
 		return fields;
 	}
 
@@ -144,8 +149,11 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 			                          &name_len, &data_type, &column_size, &decimal_digits, &nullable);
 		}
 
-		if (!SQL_SUCCEEDED(retcode) || name_len < 0 || static_cast<size_t>(name_len) >= col_name.size()) {
-			throw IOException("Failed to describe column %d for ODBC query \"%s\"\n", i + 1, query.c_str());
+		if (!SQL_SUCCEEDED(retcode)) {
+			ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, source_connection, "source_describe", query);
+		}
+		if (name_len < 0 || static_cast<size_t>(name_len) >= col_name.size()) {
+			throw IOException("Invalid Oracle column name length");
 		}
 
 		string type_name;
@@ -253,7 +261,8 @@ static SQLRETURN MeasuredGetData(SQLHSTMT stmt, SQLUSMALLINT column, SQLSMALLINT
 	return SQLGetData(stmt, column, type, data, capacity, length);
 }
 
-static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query, ODBCQueryMetrics *metrics) {
+static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const string &query, ODBCQueryMetrics *metrics,
+                            SQLHDBC source_connection) {
 	static constexpr size_t CHUNK_SIZE = 8192;
 	static constexpr size_t MAX_VALUE_SIZE = MAX_BIND_BUFFER_SIZE * 16;
 	vector<char> buffer(CHUNK_SIZE);
@@ -274,7 +283,7 @@ static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const stri
 				continue;
 			}
 			if (!SQL_SUCCEEDED(retcode) || retcode == SQL_SUCCESS_WITH_INFO) {
-				throw IOException("Failed to read fixed-width column %zu for ODBC query \"%s\"", i + 1, query.c_str());
+				ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, source_connection, "source_fetch", query);
 			}
 			field.bind_length = indicator == SQL_NO_TOTAL ? static_cast<SQLLEN>(field.bind_buffer.size()) : indicator;
 			continue;
@@ -293,8 +302,7 @@ static void ReadUnboundData(vector<ODBCField> &fields, SQLHSTMT stmt, const stri
 				break;
 			}
 			if (!SQL_SUCCEEDED(retcode)) {
-				throw IOException("Failed to read variable-width column %zu for ODBC query \"%s\"", i + 1,
-				                  query.c_str());
+				ThrowQueryODBCError(SQL_HANDLE_STMT, stmt, source_connection, "source_fetch", query);
 			}
 			size_t payload = 0;
 			if (field.c_type == SQL_C_BINARY) {
@@ -359,13 +367,14 @@ ODBCResult::ODBCResult(const std::string &query_p, ODBCStatementPtr stmt_p, ODBC
 	}
 
 	try {
-		this->fields = ReadFields(query, stmt.get(), type_config);
+		this->fields = ReadFields(query, stmt.get(), type_config, connection ? connection->GetConn() : SQL_NULL_HDBC);
 
 		if (fields.empty()) {
 			SQLSMALLINT num_cols;
 			SQLRETURN retcode = SQLNumResultCols(stmt.get(), &num_cols);
 			if (SQL_SUCCEEDED(retcode) && num_cols > 0) {
-				this->fields = ReadFields(query, stmt.get(), type_config);
+				this->fields =
+				    ReadFields(query, stmt.get(), type_config, connection ? connection->GetConn() : SQL_NULL_HDBC);
 			}
 		}
 
@@ -516,14 +525,18 @@ void ODBCResult::HandleTruncatedData() {
 			} else if (retcode == SQL_SUCCESS_WITH_INFO) {
 				f.bind_length = static_cast<SQLLEN>(total_len);
 			} else {
-				// SQLGetData failed; keep what we have, clamp length to buffer
-				f.bind_length = static_cast<SQLLEN>(already_have);
+				ThrowQueryODBCError(SQL_HANDLE_STMT, stmt.get(), connection ? connection->GetConn() : SQL_NULL_HDBC,
+				                    "source_fetch", query);
 			}
 		} else {
 			// Non-character types: just resize and re-bind for next fetch
 			f.bind_buffer.resize(total_len);
-			SQLBindCol(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.bind_buffer.data(),
-			           static_cast<SQLLEN>(f.bind_buffer.size()), &f.bind_length);
+			auto status = SQLBindCol(stmt.get(), static_cast<SQLUSMALLINT>(i + 1), c_type, f.bind_buffer.data(),
+			                         static_cast<SQLLEN>(f.bind_buffer.size()), &f.bind_length);
+			if (!SQL_SUCCEEDED(status)) {
+				ThrowQueryODBCError(SQL_HANDLE_STMT, stmt.get(), connection ? connection->GetConn() : SQL_NULL_HDBC,
+				                    "source_bind", query);
+			}
 		}
 	}
 }
@@ -589,25 +602,15 @@ bool ODBCResult::FetchNext() {
 	}
 
 	if (retcode == SQL_ERROR) {
-		// 获取详细的ODBC错误信息
-		SQLCHAR sqlstate[6] = {0};
-		SQLCHAR message[SQL_MAX_MESSAGE_LENGTH] = {0};
-		SQLINTEGER native_error = 0;
-		SQLSMALLINT message_length = 0;
-
-		SQLGetDiagRec(SQL_HANDLE_STMT, stmt.get(), 1, sqlstate, &native_error, message, SQL_MAX_MESSAGE_LENGTH,
-		              &message_length);
-
-		throw IOException("Failed to fetch result row for ODBC query \"%s\": SQLState=%s, NativeError=%d, Message=%s\n",
-		                  query.c_str(), reinterpret_cast<const char *>(sqlstate), native_error,
-		                  reinterpret_cast<const char *>(message));
+		ThrowQueryODBCError(SQL_HANDLE_STMT, stmt.get(), connection ? connection->GetConn() : SQL_NULL_HDBC,
+		                    "source_fetch", query);
 	}
 
 	if (retcode == SQL_NO_DATA) {
 		return false;
 	}
 
-	ReadUnboundData(fields, stmt.get(), query, metrics);
+	ReadUnboundData(fields, stmt.get(), query, metrics, connection ? connection->GetConn() : SQL_NULL_HDBC);
 	HandleTruncatedData();
 
 	for (size_t i = 0; i < fields.size(); i++) {

@@ -17,6 +17,24 @@ namespace duckdb {
 
 static bool debug_odbc_print_queries = false;
 
+// Statement-local timers include throwing calls and never outlive the caller.
+class ODBCExecuteTimer {
+public:
+	explicit ODBCExecuteTimer(int64_t *value_p) : value(value_p) {
+		if (value)
+			started = std::chrono::steady_clock::now();
+	}
+	~ODBCExecuteTimer() {
+		if (value)
+			*value += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
+			              .count();
+	}
+
+private:
+	int64_t *value;
+	std::chrono::steady_clock::time_point started;
+};
+
 ODBCConnection::ODBCConnection(shared_ptr<OwnedODBCConnection> connection_p, const std::string &dsn_p,
                                ODBCTypeConfig type_config_p)
     : connection(std::move(connection_p)), dsn(std::move(dsn_p)), type_config(std::move(type_config_p)) {
@@ -59,7 +77,7 @@ shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, cons
 }
 
 idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming,
-                                  uint32_t timeout_seconds) {
+                                  uint32_t timeout_seconds, ODBCQueryMetrics *metrics) {
 	if (ODBCConnection::DebugPrintQueries()) {
 		Printer::Print(query + "\n");
 	}
@@ -106,8 +124,14 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 
 	if (params.empty()) {
+		ODBCExecuteTimer timer(metrics ? &metrics->direct_us : nullptr);
+		if (metrics)
+			metrics->direct_calls++;
 		retcode = OracleODBCExecDirectUTF8(stmt, query);
 	} else {
+		ODBCExecuteTimer timer(metrics ? &metrics->prepare_us : nullptr);
+		if (metrics)
+			metrics->prepare_calls++;
 		retcode = OracleODBCPrepareUTF8(stmt, query);
 	}
 	if (!SQL_SUCCEEDED(retcode)) {
@@ -128,6 +152,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	vector<ODBCParameter> odbc_params;
 	if (params.empty()) {
 		SQLLEN affected_rows = 0;
+		ODBCExecuteTimer timer(metrics ? &metrics->result_info_us : nullptr);
 		retcode = SQLRowCount(stmt, &affected_rows);
 		if (!SQL_SUCCEEDED(retcode)) {
 			affected_rows = -1;
@@ -141,7 +166,12 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 	}
 	if (params.size() > 0) {
 		SQLSMALLINT param_count;
-		retcode = SQLNumParams(stmt, &param_count);
+		{
+			ODBCExecuteTimer timer(metrics ? &metrics->parameter_us : nullptr);
+			if (metrics)
+				metrics->parameter_calls++;
+			retcode = SQLNumParams(stmt, &param_count);
+		}
 		if (!SQL_SUCCEEDED(retcode)) {
 			// 获取详细的ODBC错误信息
 			SQLCHAR sqlstate[6] = {0};
@@ -171,7 +201,13 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 			ODBCParameter mp(query, std::move(dp));
 			odbc_params.emplace_back(std::move(mp));
 			ODBCParameter &mp_ref = odbc_params.back();
-			SQLRETURN bind_ret = mp_ref.BindParameter(stmt, odbc_params.size());
+			SQLRETURN bind_ret;
+			{
+				ODBCExecuteTimer timer(metrics ? &metrics->bind_us : nullptr);
+				if (metrics)
+					metrics->bind_calls++;
+				bind_ret = mp_ref.BindParameter(stmt, odbc_params.size());
+			}
 			if (!SQL_SUCCEEDED(bind_ret)) {
 				throw IOException("Failed to bind parameter %zu for ODBC query \"%s\"\n", odbc_params.size(),
 				                  query.c_str());
@@ -179,7 +215,12 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		}
 	}
 
-	retcode = SQLExecute(stmt);
+	{
+		ODBCExecuteTimer timer(metrics ? &metrics->execute_us : nullptr);
+		if (metrics)
+			metrics->execute_calls++;
+		retcode = SQLExecute(stmt);
+	}
 	if (!SQL_SUCCEEDED(retcode)) {
 		// 获取详细的ODBC错误信息
 		SQLCHAR sqlstate[6] = {0};
@@ -195,6 +236,7 @@ idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Val
 		                  reinterpret_cast<const char *>(message));
 	}
 
+	ODBCExecuteTimer result_info_timer(metrics ? &metrics->result_info_us : nullptr);
 	SQLLEN affected_rows = 0;
 	retcode = SQLRowCount(stmt, &affected_rows);
 	if (!SQL_SUCCEEDED(retcode)) {
@@ -242,6 +284,11 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	lock_guard<std::recursive_mutex> l(query_lock);
 
 	auto hdbc = GetConn();
+	auto query_sequence = ++connection->query_sequence;
+	if (metrics) {
+		metrics->connection_id = connection->diagnostic_id;
+		metrics->connection_query_sequence = query_sequence;
+	}
 
 	// 检查连接是否有效
 	if (!hdbc) {
@@ -283,7 +330,7 @@ unique_ptr<ODBCResult> ODBCConnection::QueryInternal(const string &query, vector
 	idx_t affected_rows = 0;
 	auto execute_started = metrics ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	try {
-		affected_rows = ODBCExecute(hstmt, query, params, result_streaming, timeout_seconds);
+		affected_rows = ODBCExecute(hstmt, query, params, result_streaming, timeout_seconds, metrics);
 		if (metrics)
 			metrics->execute_ms += std::chrono::duration_cast<std::chrono::milliseconds>(
 			                           std::chrono::steady_clock::now() - execute_started)

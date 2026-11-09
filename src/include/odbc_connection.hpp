@@ -28,6 +28,8 @@ class ODBCResult;
 
 struct OwnedODBCConnection {
 	explicit OwnedODBCConnection(SQLHDBC conn = nullptr, SQLHENV env = nullptr) : connection(conn), environment(env) {
+		static std::atomic<uint64_t> sequence {0};
+		diagnostic_id = ++sequence;
 	}
 	~OwnedODBCConnection() {
 		if (connection) {
@@ -53,6 +55,9 @@ struct OwnedODBCConnection {
 
 	SQLHDBC connection;
 	SQLHENV environment;
+	// Process-local transport identity, not an Oracle SID or credential.
+	uint64_t diagnostic_id;
+	std::atomic<uint64_t> query_sequence {0};
 };
 
 // Optional statement-local diagnostics; never a shared cache or connection state.
@@ -61,6 +66,9 @@ struct ODBCQueryMetrics {
 	int64_t materialize_ms = 0;
 	int64_t fetch_us = 0, get_data_us = 0, convert_us = 0;
 	uint64_t fetch_calls = 0, get_data_calls = 0, rows = 0, value_bytes = 0;
+	int64_t direct_us = 0, prepare_us = 0, parameter_us = 0, bind_us = 0, execute_us = 0, result_info_us = 0;
+	uint64_t direct_calls = 0, prepare_calls = 0, parameter_calls = 0, bind_calls = 0, execute_calls = 0;
+	uint64_t connection_id = 0, connection_query_sequence = 0;
 };
 
 class ODBCConnection : public enable_shared_from_this<ODBCConnection> {
@@ -112,7 +120,7 @@ private:
 	                                     ODBCConnectorInterface con_interface, uint32_t timeout_seconds = 0,
 	                                     ODBCQueryMetrics *metrics = nullptr);
 	idx_t ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming,
-	                  uint32_t timeout_seconds = 0);
+	                  uint32_t timeout_seconds = 0, ODBCQueryMetrics *metrics = nullptr);
 
 	std::recursive_mutex query_lock;
 	std::atomic<bool> connection_busy {false};

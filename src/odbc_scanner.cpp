@@ -473,7 +473,11 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 		       "rcc.column_name,'') AS referenced_column,NVL(c.delete_rule,'') AS delete_rule,c.status AS "
 		       "constraint_status,c.validated AS validated,c.deferrable AS deferrable,c.deferred AS deferred," +
 		       check_expression +
-		       " AS check_definition,c.generated AS generated_name,NVL(c.index_owner,'') AS index_owner,NVL(c."
+		       " AS check_definition,c.generated AS generated_name,NVL((SELECT CASE WHEN COUNT(*)=1 THEN MIN(bi.owner) "
+		       "END "
+		       "FROM all_indexes bi WHERE bi.table_owner=c.owner AND bi.table_name=c.table_name "
+		       "AND bi.index_name=c.index_name AND (c.index_owner IS NULL OR bi.owner=c.index_owner)), '') AS "
+		       "index_owner,NVL(c."
 		       "index_name,'') AS index_name FROM all_constraints c LEFT JOIN all_cons_columns cc ON cc.owner=c.owner "
 		       "AND cc.constraint_name=c.constraint_name AND cc.table_name=c.table_name AND cc.position IS NOT NULL "
 		       "LEFT JOIN all_constraints rc ON "

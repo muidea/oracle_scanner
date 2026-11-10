@@ -455,7 +455,8 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 			visible_condition = " AND c.hidden_column='NO'";
 		}
 		return "SELECT c.owner AS owner_name,c.table_name AS table_name,c.column_name AS column_name,TO_CHAR(c."
-		       "column_id) AS column_id,c.nullable AS is_nullable,c.data_default AS default_definition," +
+		       "column_id) AS column_id,c.nullable AS is_nullable,CASE WHEN c.default_length>0 THEN '1' ELSE '0' END "
+		       "AS default_definition," +
 		       identity_generation + " AS identity_generation," + virtual_column +
 		       " AS virtual_column,c.data_type AS data_type FROM " + column_catalog + " c" + identity_join +
 		       " WHERE c.owner=" + OracleMetadataLiteral(owner) + table_scope + visible_condition +
@@ -529,13 +530,13 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 	}
 	if (category == "indexes") {
 		auto expression_join = string();
-		auto expression = string("''");
+		auto expression = string("'0'");
 		auto index_type_condition = string(" AND i.index_type NOT LIKE 'FUNCTION-BASED%'");
 		if (capabilities.index_expressions) {
 			expression_join =
 			    " LEFT JOIN all_ind_expressions ie ON ie.index_owner=i.owner AND ie.index_name=i.index_name AND "
 			    "ie.table_owner=i.table_owner AND ie.table_name=i.table_name AND ie.column_position=ic.column_position";
-			expression = "NVL(ie.column_expression,'')";
+			expression = "CASE WHEN ie.column_position IS NULL THEN '0' ELSE '1' END";
 			index_type_condition.clear();
 		}
 		return "SELECT i.table_owner AS owner_name,i.table_name AS table_name,i.owner||':'||i.index_name AS "
@@ -551,6 +552,30 @@ static string OracleRelationalMetadataSQL(const string &category, const string &
 		       index_type_condition + " ORDER BY i.table_name,i.index_name,ic.column_position";
 	}
 	throw InvalidInputException("Unsupported oracle_relational_metadata category \"%s\"", category);
+}
+
+// Raw LONG is fetched only for rows whose fixed descriptor proves it exists.
+// Do not use XML conversion: XML normalizes CRLF and changes expression text.
+static string OracleSparseMetadataSQL(const string &category, const string &owner, const vector<string> &tables,
+                                      bool virtual_columns) {
+	string scope;
+	for (const auto &table : tables) {
+		if (!scope.empty())
+			scope += ",";
+		scope += OracleMetadataLiteral(table);
+	}
+	const auto filter = scope.empty() ? string() : " AND c.table_name IN (" + scope + ")";
+	if (category == "columnProperties") {
+		return "SELECT c.owner,c.table_name,c.column_name,c.data_default FROM " +
+		       string(virtual_columns ? "all_tab_cols" : "all_tab_columns") +
+		       " c WHERE c.owner=" + OracleMetadataLiteral(owner) + filter + " AND c.default_length>0" +
+		       (virtual_columns ? " AND c.hidden_column='NO'" : "");
+	}
+	return "SELECT "
+	       "c.table_owner,c.table_name,c.index_owner||':'||c.index_name,TO_CHAR(c.column_position),c.column_expression "
+	       "FROM all_ind_expressions c JOIN all_indexes i ON i.owner=c.index_owner AND i.index_name=c.index_name "
+	       "AND i.table_owner=c.table_owner AND i.table_name=c.table_name WHERE c.table_owner=" +
+	       OracleMetadataLiteral(owner) + filter + " AND i.index_type<>'LOB'";
 }
 
 // Per-call measurements distinguish source SQL from DuckDB function calls.
@@ -604,12 +629,14 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	auto &connection = ODBCTransaction::Get(context, catalog).GetConnection();
 	OracleMetadataPhases phases {db_name, owner, category, tables.size()};
 	string sql;
+	bool virtual_columns = false;
 	if (category == "capabilities") {
 		sql = OracleCapabilitySQL();
 		phases.probe_calls++;
 	} else {
 		phases.probe_calls++;
 		auto capabilities = ProbeOracleRelationalCapabilities(connection, &phases.probe);
+		virtual_columns = capabilities.virtual_columns;
 		sql = OracleRelationalMetadataSQL(category, owner, capabilities, tables);
 	}
 	if (category != "capabilities")
@@ -618,6 +645,23 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	auto result = connection.QueryWithTimeout(sql, ODBCResultStreaming::FORCE_MATERIALIZATION,
 	                                          ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS,
 	                                          category == "capabilities" ? &phases.probe : &phases.query);
+	if (category == "columnProperties" || category == "indexes") {
+		const idx_t column = category == "columnProperties" ? 5 : 15;
+		const vector<idx_t> keys =
+		    category == "columnProperties" ? vector<idx_t> {0, 1, 2} : vector<idx_t> {0, 1, 2, 12};
+		unique_ptr<ODBCResult> sparse;
+		if (result->HasSparseMetadataText(column)) {
+			const auto sparse_sql = OracleSparseMetadataSQL(category, owner, tables, virtual_columns);
+			const auto before_rows = phases.query.rows;
+			const auto before_fetch = phases.query.fetch_us;
+			phases.category_calls++;
+			sparse = connection.QueryWithTimeout(sparse_sql, ODBCResultStreaming::FORCE_MATERIALIZATION,
+			                                     ORACLE_RELATIONAL_QUERY_TIMEOUT_SECONDS, &phases.query);
+			phases.sparse_rows = phases.query.rows - before_rows;
+			phases.sparse_fetch_us = phases.query.fetch_us - before_fetch;
+		}
+		result->MergeSparseMetadataText(column, keys, sparse.get());
+	}
 	for (auto &field : result->Fields()) {
 		names.push_back(field.name);
 		return_types.push_back(field.duckdb_type);

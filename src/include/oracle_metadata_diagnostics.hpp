@@ -32,6 +32,8 @@ struct OracleMetadataPhases {
 	idx_t tables;
 	ODBCQueryMetrics probe, query;
 	int probe_calls = 0, category_calls = 0;
+	uint64_t sparse_rows = 0;
+	int64_t sparse_fetch_us = 0;
 	bool success = false;
 	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 	void SetSQL(const string &value) noexcept {
@@ -75,7 +77,7 @@ struct OracleMetadataPhases {
 			    "fields=%llu unbound_fields=%llu long_fields=%llu lob_fields=%llu "
 			    "first_fetch_us=%lld max_fetch_us=%lld fetch_ge_1ms=%llu fetch_ge_10ms=%llu fetch_ge_100ms=%llu "
 			    "fetch_info=%llu "
-			    "result=%s\n",
+			    "sparse_text_rows=%llu sparse_text_fetch_us=%lld result=%s\n",
 			    quote(catalog).c_str(), quote(owner).c_str(), quote(category).c_str(),
 			    static_cast<unsigned long long>(tables), probe_calls, category_calls,
 			    static_cast<long long>(probe.execute_ms), static_cast<long long>(probe.materialize_ms),
@@ -109,7 +111,8 @@ struct OracleMetadataPhases {
 			    static_cast<unsigned long long>(query.fetch_ge_1ms),
 			    static_cast<unsigned long long>(query.fetch_ge_10ms),
 			    static_cast<unsigned long long>(query.fetch_ge_100ms),
-			    static_cast<unsigned long long>(query.fetch_info), success ? "success" : "failed");
+			    static_cast<unsigned long long>(query.fetch_info), static_cast<unsigned long long>(sparse_rows),
+			    static_cast<long long>(sparse_fetch_us), success ? "success" : "failed");
 		} catch (...) { /* Diagnostics must never change source execution. */
 		}
 	}

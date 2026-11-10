@@ -62,6 +62,8 @@ public:
 	bool Next();
 	idx_t AffectedRows();
 	const vector<ODBCField> &Fields();
+	bool HasSparseMetadataText(idx_t column) const;
+	void MergeSparseMetadataText(idx_t column, const vector<idx_t> &keys, const ODBCResult *sparse);
 
 private:
 	string query;

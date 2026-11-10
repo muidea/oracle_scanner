@@ -1,6 +1,7 @@
 #include "query_odbc_source_error.hpp"
 #include "include/odbc_result.hpp"
 #include "odbc_connection.hpp"
+#include "oracle_sparse_metadata.hpp"
 #include "storage/odbc_connection_pool.hpp"
 
 #include "duckdb/common/types/hugeint.hpp"
@@ -552,6 +553,19 @@ void ODBCResult::HandleTruncatedData() {
 			}
 		}
 	}
+}
+
+bool ODBCResult::HasSparseMetadataText(idx_t column) const {
+	if (is_streaming || column >= fields.size())
+		throw InternalException("Sparse Oracle metadata requires a materialized text column");
+	return OracleMetadataHasText(cached_chunks, column);
+}
+
+void ODBCResult::MergeSparseMetadataText(idx_t column, const vector<idx_t> &keys, const ODBCResult *sparse) {
+	if (is_streaming || column >= fields.size() || (sparse && sparse->is_streaming))
+		throw InternalException("Sparse Oracle metadata requires materialized results");
+	const vector<unique_ptr<DataChunk>> empty;
+	MergeOracleMetadataText(cached_chunks, column, keys, sparse ? sparse->cached_chunks : empty);
 }
 
 DataChunk &ODBCResult::NextChunk() {

@@ -49,6 +49,10 @@ target_link_libraries(${TARGET_NAME}_loadable_extension
 
 option(SCANNER_BUILD_CAPABILITY_TESTS "Build scanner capability contract tests" OFF)
 if(SCANNER_BUILD_CAPABILITY_TESTS)
+    add_executable(oracle_sparse_metadata_test test/oracle_sparse_metadata_test.cpp)
+    target_include_directories(oracle_sparse_metadata_test PRIVATE src/include)
+    target_link_libraries(oracle_sparse_metadata_test duckdb)
+    add_test(NAME oracle_sparse_metadata COMMAND oracle_sparse_metadata_test)
     add_executable(guarded_odbc_source_error_test test/guarded_odbc_source_error_test.cpp)
     target_include_directories(guarded_odbc_source_error_test PRIVATE src/include)
     target_link_libraries(guarded_odbc_source_error_test duckdb)

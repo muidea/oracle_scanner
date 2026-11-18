@@ -84,18 +84,18 @@ inline void ODBCExactNumericKeyFunction(DataChunk &args, ExpressionState &, Vect
 		return StringVector::AddString(result, ODBCExactNumericKey(value.GetString()));
 	});
 }
-inline unique_ptr<FunctionData> BindODBCExactNumericKey(ClientContext &, ScalarFunction &function,
-                                                        vector<unique_ptr<Expression>> &arguments) {
-	if (arguments.size() != 1 || arguments[0]->return_type.id() != LogicalTypeId::VARCHAR)
+inline unique_ptr<FunctionData> BindODBCExactNumericKey(BindScalarFunctionInput &input) {
+	auto &arguments = input.GetArguments();
+	if (arguments.size() != 1 || arguments[0]->GetReturnType().id() != LogicalTypeId::VARCHAR)
 		throw BinderException("Exact numeric collation requires text input");
-	function.arguments[0] = arguments[0]->return_type;
+	input.GetBoundFunction().GetArguments()[0] = arguments[0]->GetReturnType();
 	return nullptr;
 }
 inline void RegisterODBCExactNumericCollation(ExtensionLoader &loader, const string &name) {
-	ScalarFunction key(name, {LogicalType::VARCHAR}, LogicalType::VARCHAR, ODBCExactNumericKeyFunction,
+	ScalarFunction key(Identifier(name), {LogicalType::VARCHAR}, LogicalType::VARCHAR, ODBCExactNumericKeyFunction,
 	                   BindODBCExactNumericKey);
-	key.collation_handling = FunctionCollationHandling::IGNORE_COLLATIONS;
-	CreateCollationInfo info(name, key, false, false);
+	key.SetCollationHandling(FunctionCollationHandling::IGNORE_COLLATIONS);
+	CreateCollationInfo info(Identifier(name), key, false, false);
 	loader.RegisterCollation(info);
 }
 } // namespace duckdb

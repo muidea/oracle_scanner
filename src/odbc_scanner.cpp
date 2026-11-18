@@ -7,6 +7,7 @@
 #include "storage/odbc_connection_pool.hpp"
 #include "storage/odbc_table_set.hpp"
 #include "odbc_filter_pushdown.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "oracle_metadata_diagnostics.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -69,7 +70,7 @@ static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx
 		return false;
 	}
 	auto src = FlatVector::GetData<string_t>(res_vec);
-	auto dst = FlatVector::GetData<timestamp_tz_t>(output_vec);
+	auto dst = FlatVector::GetDataMutable<timestamp_tz_t>(output_vec);
 	for (idx_t r = 0; r < count; r++) {
 		if (FlatVector::IsNull(res_vec, r)) {
 			FlatVector::SetNull(output_vec, r, true);
@@ -91,7 +92,7 @@ static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx
 }
 
 static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBindInput &input,
-                                         vector<LogicalType> &return_types, vector<string> &names) {
+                                         vector<LogicalType> &return_types, vector<Identifier> &names) {
 	throw InternalException("ODBCBind");
 }
 
@@ -114,15 +115,15 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 				col_name = bind_data.remote_names[column_id];
 			} else {
 				auto &col = bind_data.table.GetColumn(LogicalIndex(column_id));
-				col_name = col.GetName();
+				col_name = col.GetName().GetIdentifierName();
 			}
 			select += ODBCUtils::WriteIdentifier(col_name);
 		}
 	}
 	select += " FROM ";
-	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name);
+	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name.GetIdentifierName());
 	select += ".";
-	select += ODBCUtils::WriteIdentifier(bind_data.table.name);
+	select += ODBCUtils::WriteIdentifier(bind_data.table.name.GetIdentifierName());
 	auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
 	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, filter_names);
 	if (!filter_string.empty()) {
@@ -222,24 +223,26 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 static InsertionOrderPreservingMap<string> ODBCScanToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
-	result["Table"] = bind_data.table.name;
+	result["Table"] = bind_data.table.name.GetIdentifierName();
 	return result;
 }
 
 static void ODBCScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                              const TableFunction &function) {
+                              const BoundTableFunction &function) {
 	throw NotImplementedException("ODBCScanSerialize");
 }
 
-static unique_ptr<FunctionData> ODBCScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> ODBCScanDeserialize(Deserializer &deserializer, BoundTableFunction &function) {
 	throw NotImplementedException("ODBCScanDeserialize");
 }
 
-static BindInfo ODBCGetBindInfo(const optional_ptr<FunctionData> bind_data_p) {
+static optional_ptr<TableCatalogEntry> ODBCGetTableEntry(optional_ptr<const FunctionData> bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<ODBCBindData>();
-	BindInfo info(ScanType::EXTERNAL);
-	info.table = bind_data.table;
-	return info;
+	return &bind_data.table;
+}
+
+static BindInfo ODBCGetBindInfo(TableFunctionGetBindInfoInput &input) {
+	return BindInfo(ScanType::EXTERNAL);
 }
 
 ODBCScanFunction::ODBCScanFunction()
@@ -249,6 +252,7 @@ ODBCScanFunction::ODBCScanFunction()
 	serialize = ODBCScanSerialize;
 	deserialize = ODBCScanDeserialize;
 	get_bind_info = ODBCGetBindInfo;
+	get_table_entry = ODBCGetTableEntry;
 	projection_pushdown = true;
 }
 
@@ -278,7 +282,7 @@ static void ValidateOracleReadOnlyQuery(const string &sql) {
 }
 
 static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
 		throw BinderException("Parameters to oracle_query cannot be NULL");
 	}
@@ -286,7 +290,7 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 	// look up the database to query
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto &db_manager = DatabaseManager::Get(context);
-	auto db = db_manager.GetDatabase(context, db_name);
+	auto db = db_manager.GetDatabase(context, Identifier(db_name));
 	if (!db) {
 		throw BinderException("Failed to find attached database \"%s\" referenced in oracle_query", db_name);
 	}
@@ -322,7 +326,7 @@ static unique_ptr<FunctionData> ODBCQueryBind(ClientContext &context, TableFunct
 		result = transaction.GetConnection().Query(sql, std::move(params), ODBCResultStreaming::FORCE_MATERIALIZATION);
 	}
 	for (auto &field : result->Fields()) {
-		names.push_back(field.name);
+		names.emplace_back(field.name);
 		return_types.push_back(field.duckdb_type);
 	}
 	if (return_types.empty()) {
@@ -350,7 +354,7 @@ ODBCQueryFunction::ODBCQueryFunction()
                     ODBCQueryInitGlobalState, ODBCInitLocalState) {
 	serialize = ODBCScanSerialize;
 	deserialize = ODBCScanDeserialize;
-	named_parameters["params"] = LogicalType::ANY;
+	GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) { options.Add("params", LogicalType::ANY); });
 }
 
 //===--------------------------------------------------------------------===//
@@ -582,7 +586,8 @@ static string OracleSparseMetadataSQL(const string &category, const string &owne
 // Materialization includes field decoding/fetch, not Go result consumption.
 
 static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &context, TableFunctionBindInput &input,
-                                                           vector<LogicalType> &return_types, vector<string> &names) {
+                                                           vector<LogicalType> &return_types,
+                                                           vector<Identifier> &names) {
 	for (auto &value : input.inputs) {
 		if (value.IsNull()) {
 			throw BinderException("Parameters to oracle_relational_metadata cannot be NULL");
@@ -592,7 +597,7 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	auto category = input.inputs[1].GetValue<string>();
 	auto owner = input.inputs[2].GetValue<string>();
 	if ((category == "columnExpressions" || category == "checkExpressions") &&
-	    input.table_function.name != "oracle_relational_metadata_scoped_v2")
+	    input.table_function.GetName().GetIdentifierName() != "oracle_relational_metadata_scoped_v2")
 		throw BinderException("Oracle expression metadata requires the scoped v2 contract");
 	vector<string> tables;
 	if (input.inputs.size() == 4) {
@@ -612,7 +617,7 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 		throw BinderException("Oracle owner passed to oracle_relational_metadata cannot be empty");
 	}
 	auto &db_manager = DatabaseManager::Get(context);
-	auto db = db_manager.GetDatabase(context, db_name);
+	auto db = db_manager.GetDatabase(context, Identifier(db_name));
 	if (!db) {
 		throw BinderException("Failed to find attached database \"%s\" referenced in oracle_relational_metadata",
 		                      db_name);
@@ -663,7 +668,7 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 		result->MergeSparseMetadataText(column, keys, sparse.get());
 	}
 	for (auto &field : result->Fields()) {
-		names.push_back(field.name);
+		names.emplace_back(field.name);
 		return_types.push_back(field.duckdb_type);
 	}
 	if (return_types.empty()) {

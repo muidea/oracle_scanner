@@ -18,7 +18,8 @@ ODBCSchemaSet::ODBCSchemaSet(Catalog &catalog) : ODBCCatalogSet(catalog) {
 
 void ODBCSchemaSet::LoadEntries(ClientContext &context) {
 	auto &transaction = ODBCTransaction::Get(context, catalog);
-	auto schema_name = catalog.Cast<ODBCCatalog>().GetDefaultSchema();
+	auto default_schema_opt = catalog.Cast<ODBCCatalog>().GetDefaultSchema();
+	string schema_name = default_schema_opt.has_value() ? default_schema_opt->GetIdentifierName() : string();
 	if (schema_name.empty()) {
 		auto result = transaction.Query("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM DUAL");
 		if (result->Next() && !result->IsNull(0)) {
@@ -31,7 +32,7 @@ void ODBCSchemaSet::LoadEntries(ClientContext &context) {
 	}
 
 	CreateSchemaInfo info;
-	info.schema = std::move(schema_name);
+	info.SetSchema(Identifier(schema_name));
 	info.internal = false;
 	CreateEntry(make_uniq<ODBCSchemaEntry>(catalog, info));
 }

@@ -55,7 +55,7 @@ static bool ODBCMetadataSchemaIsInternal(const string &name, bool was_quoted) {
 static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindData &bind_data,
                                      SchemaCatalogEntry &schema) {
 	auto &odbc_catalog = schema.ParentCatalog().Cast<ODBCCatalog>();
-	if (ODBCMetadataSchemaIsInternal(schema.name, odbc_catalog.DefaultSchemaWasQuoted())) {
+	if (ODBCMetadataSchemaIsInternal(schema.name.GetIdentifierName(), odbc_catalog.DefaultSchemaWasQuoted())) {
 		return;
 	}
 	schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
@@ -64,11 +64,11 @@ static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindDat
 		int64_t ordinal = 1;
 		for (auto &column : table.GetColumns().Logical()) {
 			ODBCMetadataRow row;
-			row.table_schema = schema.name;
-			row.table_name = table.name;
+			row.table_schema = schema.name.GetIdentifierName();
+			row.table_name = table.name.GetIdentifierName();
 			row.table_type = oracle_table.IsView() ? "VIEW" : "BASE TABLE";
 			row.table_comment = "";
-			row.column_name = column.GetName();
+			row.column_name = column.GetName().GetIdentifierName();
 			row.data_type = column.GetType().ToString();
 			row.ordinal_position = ordinal++;
 			row.column_comment = "";
@@ -78,7 +78,7 @@ static void ODBCMetadataAppendSchema(ClientContext &context, ODBCMetadataBindDat
 }
 
 static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	if (input.inputs[0].IsNull()) {
 		throw BinderException("Parameters to oracle_metadata cannot be NULL");
 	}
@@ -98,7 +98,7 @@ static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFu
 		}
 	}
 	auto &db_manager = DatabaseManager::Get(context);
-	auto db = db_manager.GetDatabase(context, db_name);
+	auto db = db_manager.GetDatabase(context, Identifier(db_name));
 	if (!db) {
 		throw BinderException("Failed to find attached database \"%s\" referenced in oracle_metadata", db_name);
 	}
@@ -110,7 +110,7 @@ static unique_ptr<FunctionData> ODBCMetadataBind(ClientContext &context, TableFu
 	auto bind_data = make_uniq<ODBCMetadataBindData>();
 	auto &odbc_catalog = catalog.Cast<ODBCCatalog>();
 	if (!schema_filter.empty()) {
-		auto &schema = odbc_catalog.GetSchema(context, schema_filter);
+		auto &schema = odbc_catalog.GetSchema(context, Identifier(schema_filter));
 		ODBCMetadataAppendSchema(context, *bind_data, schema);
 	} else {
 		odbc_catalog.ScanSchemas(
@@ -146,7 +146,7 @@ static void ODBCMetadataScan(ClientContext &context, TableFunctionInput &data, D
 ODBCMetadataFunction::ODBCMetadataFunction()
     : TableFunction("oracle_metadata", {LogicalType::VARCHAR}, ODBCMetadataScan, ODBCMetadataBind,
                     ODBCMetadataInitGlobalState) {
-	varargs = LogicalType::VARCHAR;
+	GetSignature().AddArgs("schemas", LogicalType::VARCHAR);
 }
 
 } // namespace duckdb

@@ -68,7 +68,7 @@ string AddConnectionOption(const KeyValueSecret &kv_secret, const string &name,
 		// option already provided in connection string
 		return string();
 	}
-	Value input_val = kv_secret.TryGetValue(name);
+	Value input_val = kv_secret.TryGetValue(Identifier(name));
 	if (input_val.IsNull()) {
 		// not provided
 		return string();
@@ -437,7 +437,7 @@ optional_ptr<CatalogEntry> ODBCCatalog::CreateSchema(CatalogTransaction transact
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
 		DropInfo try_drop;
 		try_drop.type = CatalogType::SCHEMA_ENTRY;
-		try_drop.name = info.schema;
+		try_drop.SetName(info.SchemaName());
 		try_drop.if_not_found = OnEntryNotFound::RETURN_NULL;
 		try_drop.cascade = false;
 		schemas.DropEntry(transaction.GetContext(), try_drop);
@@ -490,11 +490,11 @@ bool ODBCCatalog::IsODBCQuery(const string &name) {
 void ODBCCatalog::MaterializeODBCScans(PhysicalOperator &op) {
 	if (op.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &table_scan = op.Cast<PhysicalTableScan>();
-		if (ODBCCatalog::IsODBCScan(table_scan.function.name)) {
+		if (ODBCCatalog::IsODBCScan(table_scan.function.GetName().GetIdentifierName())) {
 			auto &bind_data = table_scan.bind_data->Cast<ODBCBindData>();
 			bind_data.streaming = ODBCResultStreaming::FORCE_MATERIALIZATION;
 		}
-		if (ODBCCatalog::IsODBCQuery(table_scan.function.name)) {
+		if (ODBCCatalog::IsODBCQuery(table_scan.function.GetName().GetIdentifierName())) {
 			auto &bind_data = table_scan.bind_data->Cast<ODBCQueryBindData>();
 			bind_data.streaming = ODBCResultStreaming::FORCE_MATERIALIZATION;
 		}

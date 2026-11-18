@@ -694,8 +694,8 @@ string ODBCResult::GetString(idx_t col) {
 	ODBCField &f = fields[col];
 	if (f.duckdb_type.id() == LogicalTypeId::VARCHAR || f.duckdb_type.id() == LogicalTypeId::BLOB) {
 		Vector &vec = CurrentRowChunk().data[col];
-		string_t *data = FlatVector::GetData<string_t>(vec);
-		string_t &st = data[row_idx];
+		const string_t *data = FlatVector::GetData<string_t>(vec);
+		const string_t &st = data[row_idx];
 		return string(st.GetData(), st.GetSize());
 	}
 	throw InternalException("Get called for a String type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
@@ -707,10 +707,10 @@ int32_t ODBCResult::GetInt32(idx_t col) {
 	ODBCField &f = fields[col];
 	Vector &vec = CurrentRowChunk().data[col];
 	if (f.duckdb_type.id() == LogicalTypeId::INTEGER) {
-		int32_t *data = FlatVector::GetData<int32_t>(vec);
+		const int32_t *data = FlatVector::GetData<int32_t>(vec);
 		return data[row_idx];
 	} else if (f.duckdb_type.id() == LogicalTypeId::UINTEGER) {
-		uint32_t *data = FlatVector::GetData<uint32_t>(vec);
+		const uint32_t *data = FlatVector::GetData<uint32_t>(vec);
 		return static_cast<int32_t>(data[row_idx]);
 	}
 	throw InternalException("Get called for an Int32 type, actual type: \"%s\", column: %zu, ODBC query \"%s\"\n",
@@ -725,44 +725,44 @@ int64_t ODBCResult::GetInt64(idx_t col) {
 	// Handle various integer types that can be converted to int64_t
 	switch (f.duckdb_type.id()) {
 	case LogicalTypeId::TINYINT: {
-		int8_t *data = FlatVector::GetData<int8_t>(vec);
+		const int8_t *data = FlatVector::GetData<int8_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::UTINYINT: {
-		uint8_t *data = FlatVector::GetData<uint8_t>(vec);
+		const uint8_t *data = FlatVector::GetData<uint8_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::SMALLINT: {
-		int16_t *data = FlatVector::GetData<int16_t>(vec);
+		const int16_t *data = FlatVector::GetData<int16_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::USMALLINT: {
-		uint16_t *data = FlatVector::GetData<uint16_t>(vec);
+		const uint16_t *data = FlatVector::GetData<uint16_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::INTEGER: {
-		int32_t *data = FlatVector::GetData<int32_t>(vec);
+		const int32_t *data = FlatVector::GetData<int32_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::UINTEGER: {
-		uint32_t *data = FlatVector::GetData<uint32_t>(vec);
+		const uint32_t *data = FlatVector::GetData<uint32_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::BIGINT: {
-		int64_t *data = FlatVector::GetData<int64_t>(vec);
+		const int64_t *data = FlatVector::GetData<int64_t>(vec);
 		return data[row_idx];
 	}
 	case LogicalTypeId::UBIGINT: {
-		uint64_t *data = FlatVector::GetData<uint64_t>(vec);
+		const uint64_t *data = FlatVector::GetData<uint64_t>(vec);
 		return static_cast<int64_t>(data[row_idx]);
 	}
 	case LogicalTypeId::DOUBLE: {
 		if (vec.GetType().id() == LogicalTypeId::DOUBLE) {
-			double *data = FlatVector::GetData<double>(vec);
+			const double *data = FlatVector::GetData<double>(vec);
 			return static_cast<int64_t>(data[row_idx]);
 		} else if (vec.GetType().id() == LogicalTypeId::VARCHAR) {
-			string_t *data = FlatVector::GetData<string_t>(vec);
-			string_t st = data[row_idx];
+			const string_t *data = FlatVector::GetData<string_t>(vec);
+			const string_t st = data[row_idx];
 			return atoll(st.GetData());
 		}
 		break;
@@ -805,7 +805,7 @@ static void WriteTimeAsString(ODBCField &f, Vector &vec, idx_t row) {
 	dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
 	string time_str = Time::ToString(tm);
 	string_t st(time_str.c_str(), time_str.length());
-	auto data = FlatVector::GetData<string_t>(vec);
+	auto data = FlatVector::GetDataMutable<string_t>(vec);
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
@@ -821,7 +821,7 @@ static void WriteExactDecimal(const string &text, Vector &vec, idx_t row, uint8_
 		throw ConversionException("ODBC DECIMAL value %s cannot be represented exactly as DECIMAL(%d,%d)", text,
 		                          precision, scale);
 	}
-	FlatVector::GetData<T>(vec)[row] = value;
+	FlatVector::GetDataMutable<T>(vec)[row] = value;
 }
 
 static void WriteDecimal(ODBCField &f, Vector &vec, idx_t row) {
@@ -856,7 +856,7 @@ static void WriteDoubleFromString(ODBCField &f, Vector &vec, idx_t row) {
 	}
 	string value(f.ValueData(), NumericCast<size_t>(f.bind_length));
 	try {
-		FlatVector::GetData<double>(vec)[row] = std::stod(value);
+		FlatVector::GetDataMutable<double>(vec)[row] = std::stod(value);
 	} catch (const std::exception &e) {
 		throw InvalidInputException("Failed to parse Oracle NUMBER value '%s' as DOUBLE: %s", value, e.what());
 	}
@@ -897,7 +897,7 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 		}
 		string utf8_val = UTF16UnitsToUTF8(wdata, unit_len);
 		string_t st(utf8_val.c_str(), utf8_val.length());
-		auto data = FlatVector::GetData<string_t>(vec);
+		auto data = FlatVector::GetDataMutable<string_t>(vec);
 		data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 		return;
 	}
@@ -907,14 +907,14 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 	}
 
 	string_t st(f.ValueData(), f.bind_length);
-	auto data = FlatVector::GetData<string_t>(vec);
+	auto data = FlatVector::GetDataMutable<string_t>(vec);
 	data[row] = StringVector::AddStringOrBlob(vec, std::move(st));
 }
 
 static void WriteBool(ODBCField &f, Vector &vec, idx_t row) {
 
 	D_ASSERT(f.bind_buffer.size() >= sizeof(int8_t));
-	auto data = FlatVector::GetData<bool>(vec);
+	auto data = FlatVector::GetDataMutable<bool>(vec);
 	if (f.odbc_type == SQL_TINYINT || f.odbc_type == SQL_BIT) {
 		int8_t val = *reinterpret_cast<int8_t *>(f.bind_buffer.data());
 		data[row] = val != 0;
@@ -940,7 +940,7 @@ static void WriteNumber(ODBCField &f, Vector &vec, idx_t row) {
 	D_ASSERT(f.bind_buffer.size() >= sizeof(NUM_TYPE));
 	NUM_TYPE num = *reinterpret_cast<NUM_TYPE *>(f.bind_buffer.data());
 
-	auto data = FlatVector::GetData<NUM_TYPE>(vec);
+	auto data = FlatVector::GetDataMutable<NUM_TYPE>(vec);
 	data[row] = num;
 }
 
@@ -961,7 +961,7 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 	switch (vec.GetType().id()) {
 	case LogicalTypeId::DATE: {
 		date_t val = Date::FromDate(ts->year, ts->month, ts->day);
-		date_t *data = FlatVector::GetData<date_t>(vec);
+		date_t *data = FlatVector::GetDataMutable<date_t>(vec);
 		data[row] = val;
 		break;
 	}
@@ -971,7 +971,7 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 			throw BinderException("time field value out of range, hour value: " + std::to_string(ts->hour));
 		}
 		dtime_t val = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
-		dtime_t *data = FlatVector::GetData<dtime_t>(vec);
+		dtime_t *data = FlatVector::GetDataMutable<dtime_t>(vec);
 		data[row] = val;
 		break;
 	}
@@ -979,7 +979,7 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 		date_t dt = Date::FromDate(ts->year, ts->month, ts->day);
 		dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
 		timestamp_t val = Timestamp::FromDatetime(dt, tm);
-		timestamp_t *data = FlatVector::GetData<timestamp_t>(vec);
+		timestamp_t *data = FlatVector::GetDataMutable<timestamp_t>(vec);
 		data[row] = val;
 		break;
 	}
@@ -989,7 +989,7 @@ static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
 		date_t dt = Date::FromDate(ts->year, ts->month, ts->day);
 		dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
 		timestamp_t val = Timestamp::FromDatetime(dt, tm);
-		timestamp_tz_t *data = FlatVector::GetData<timestamp_tz_t>(vec);
+		timestamp_tz_t *data = FlatVector::GetDataMutable<timestamp_tz_t>(vec);
 		data[row] = timestamp_tz_t(val.value);
 		break;
 	}

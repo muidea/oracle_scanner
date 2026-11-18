@@ -38,7 +38,8 @@ static bool ODBCSchemaIsInternal(const string &name, bool was_quoted) {
 
 void ODBCTableSet::LoadEntries(ClientContext &context) {
 	auto &odbc_catalog = schema.ParentCatalog().Cast<ODBCCatalog>();
-	if (ODBCSchemaIsInternal(schema.name, odbc_catalog.DefaultSchemaWasQuoted())) {
+	const auto &schema_name = schema.name.GetIdentifierName();
+	if (ODBCSchemaIsInternal(schema_name, odbc_catalog.DefaultSchemaWasQuoted())) {
 		return;
 	}
 
@@ -55,7 +56,7 @@ void ODBCTableSet::LoadEntries(ClientContext &context) {
 	  AND OBJECT_NAME NOT LIKE 'BIN$%'
 	ORDER BY OBJECT_NAME
 	)",
-	                                         "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	                                         "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name));
 	auto columns_query = StringUtil::Replace(R"(
 	SELECT
 	    TABLE_NAME,
@@ -68,7 +69,7 @@ void ODBCTableSet::LoadEntries(ClientContext &context) {
 	  AND TABLE_NAME NOT LIKE 'BIN$%'
 	ORDER BY TABLE_NAME, COLUMN_ID
 	)",
-	                                         "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name));
+	                                         "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema_name));
 
 	auto load_table_entries_from_oracle_catalog = [&]() -> idx_t {
 		auto &transaction = ODBCTransaction::Get(context, catalog);
@@ -117,7 +118,7 @@ void ODBCTableSet::LoadEntries(ClientContext &context) {
 					table_info = make_uniq<ODBCTableInfo>(schema, table_name, object->second != "TABLE");
 				}
 				auto column_type = ODBCTypes::TypeToLogicalType(type_config, type_info);
-				ColumnDefinition column(std::move(column_name), std::move(column_type));
+				ColumnDefinition column(Identifier(std::move(column_name)), std::move(column_type));
 				table_info->create_info->columns.AddColumn(std::move(column));
 				table_info->remote_column_names.push_back(std::move(remote_column_name));
 			}
@@ -200,7 +201,7 @@ void ODBCTableSet::LoadEntries(ClientContext &context) {
 			}
 		};
 
-		retcode = SQLTables(stmt, nullptr, 0, (SQLCHAR *)schema.name.c_str(), SQL_NTS, nullptr, 0,
+		retcode = SQLTables(stmt, nullptr, 0, (SQLCHAR *)schema_name.c_str(), SQL_NTS, nullptr, 0,
 		                    (SQLCHAR *)"TABLE,VIEW", SQL_NTS);
 		if (!SQL_SUCCEEDED(retcode)) {
 			cleanup();
@@ -256,7 +257,7 @@ string GetTableInfoQuery(const string &schema_name, const string &table_name) {
 unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODBCSchemaEntry &schema,
                                                      const string &table_name, bool is_view) {
 	auto &transaction = ODBCTransaction::Get(context, schema.ParentCatalog());
-	auto query = GetTableInfoQuery(schema.name, table_name);
+	auto query = GetTableInfoQuery(schema.name.GetIdentifierName(), table_name);
 	auto result = transaction.Query(query);
 	auto table_info = make_uniq<ODBCTableInfo>(schema, table_name, is_view);
 	// The probe query returns no rows; we only need the field metadata.
@@ -266,7 +267,7 @@ unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODB
 		if (column_name.empty()) {
 			continue;
 		}
-		ColumnDefinition column(std::move(column_name), field.duckdb_type);
+		ColumnDefinition column(Identifier(std::move(column_name)), field.duckdb_type);
 		table_info->create_info->columns.AddColumn(std::move(column));
 		table_info->remote_column_names.push_back(std::move(remote_column_name));
 	}

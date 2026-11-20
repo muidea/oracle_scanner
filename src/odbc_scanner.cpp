@@ -596,9 +596,8 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 	auto db_name = input.inputs[0].GetValue<string>();
 	auto category = input.inputs[1].GetValue<string>();
 	auto owner = input.inputs[2].GetValue<string>();
-	if ((category == "columnExpressions" || category == "checkExpressions") &&
-	    input.table_function.GetName().GetIdentifierName() != "oracle_relational_metadata_scoped_v2")
-		throw BinderException("Oracle expression metadata requires the scoped v2 contract");
+	if ((category == "columnExpressions" || category == "checkExpressions") && input.inputs.size() != 4)
+		throw BinderException("Oracle expression metadata requires scoped table list");
 	vector<string> tables;
 	if (input.inputs.size() == 4) {
 		for (const auto &value : ListValue::GetChildren(input.inputs[3])) {
@@ -680,9 +679,7 @@ static unique_ptr<FunctionData> ODBCRelationalMetadataBind(ClientContext &contex
 }
 
 ODBCRelationalMetadataFunction::ODBCRelationalMetadataFunction(bool scoped, bool expressions)
-    : TableFunction(expressions ? "oracle_relational_metadata_scoped_v2"
-                    : scoped    ? "oracle_relational_metadata_scoped_v1"
-                                : "oracle_relational_metadata",
+    : TableFunction("oracle_relational_metadata",
                     scoped ? vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
                                                   LogicalType::LIST(LogicalType::VARCHAR)}
                            : vector<LogicalType> {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},

@@ -140,7 +140,7 @@ static void ODBCMetadataScan(ClientContext &context, TableFunctionInput &data, D
 		output.SetValue(7, count, Value(row.column_comment));
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 ODBCMetadataFunction::ODBCMetadataFunction()

@@ -639,7 +639,6 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	session.reset(); // join cancellation thread before disconnecting this session
 	if (connection)
 		connection->Close(); // isolated state is never returned for reuse
-	out.SetCardinality(1);
 	out.SetValue(0, 0, Value(status));
 	out.SetValue(1, 0, Value::BIGINT(affected));
 	out.SetValue(2, 0, Value(error));
@@ -648,6 +647,7 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	out.SetValue(5, 0, Value(descriptor));
 	if (d.diagnostics)
 		out.SetValue(6, 0, Value(source_error));
+	out.SetChildCardinality(1);
 }
 
 // Administrative DuckDB callers use an explicitly writable attachment.
@@ -693,8 +693,8 @@ static void AdminScan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out
 		Reject();
 	}
 	connection->Close();
-	out.SetCardinality(1);
 	out.SetValue(0, 0, Value::BOOLEAN(true));
+	out.SetChildCardinality(1);
 }
 } // namespace
 void RegisterOracleGuardedCRUD(ExtensionLoader &loader) {

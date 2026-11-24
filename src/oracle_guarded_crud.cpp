@@ -15,10 +15,13 @@
 #include "oracle_odbc_unicode.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <chrono>
 #include <condition_variable>
+#include <iomanip>
 #include <mutex>
+#include <sstream>
 #include <thread>
 
 namespace duckdb {
@@ -224,25 +227,68 @@ public:
 			Reject();
 		return r[0][0];
 	}
-	int64_t Execute(const string &sql, const vector<Value> &params, bool &sent) {
-		Start();
-		Check(OracleODBCPrepareUTF8(stmt.get(), sql));
-		SQLSMALLINT count = 0;
-		Check(SQLNumParams(stmt.get(), &count));
-		if (count != params.size() || count > 2100)
-			Reject();
-		std::vector<std::vector<SQLWCHAR>> values(params.size());
-		vector<SQLLEN> lengths(params.size(), 0);
+	void BindInputParams(const vector<Value> &params, std::vector<std::vector<SQLWCHAR>> &values, vector<string> &blobs,
+	                     vector<SQLLEN> &lengths) {
+		static char empty_blob_byte = 0;
 		for (idx_t i = 0; i < params.size(); i++) {
 			auto &v = params[i];
+			if (v.type().id() == LogicalTypeId::BLOB) {
+				if (v.IsNull()) {
+					lengths[i] = SQL_NULL_DATA;
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY, 1, 0,
+					                       &empty_blob_byte, 0, &lengths[i]));
+				} else {
+					blobs[i] = StringValue::Get(v);
+					if (blobs[i].size() > 4 * 1024 * 1024)
+						Reject();
+					lengths[i] = static_cast<SQLLEN>(blobs[i].size());
+					Check(SQLBindParameter(
+					    stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY,
+					    std::max<size_t>(1, blobs[i].size()), 0,
+					    blobs[i].empty() ? &empty_blob_byte : const_cast<char *>(blobs[i].data()), blobs[i].size(),
+					    &lengths[i]));
+				}
+				continue;
+			}
 			if (v.IsNull())
 				lengths[i] = SQL_NULL_DATA;
 			else {
-				if (v.type().id() != LogicalTypeId::VARCHAR)
+				string text;
+				switch (v.type().id()) {
+				case LogicalTypeId::VARCHAR:
+					text = v.GetValue<string>();
+					if (text.empty() || text.size() > 4000 || text.find('\0') != string::npos)
+						Reject();
+					break;
+				case LogicalTypeId::BOOLEAN:
+					text = v.GetValue<bool>() ? "1" : "0";
+					break;
+				case LogicalTypeId::SMALLINT:
+				case LogicalTypeId::INTEGER:
+				case LogicalTypeId::BIGINT:
+					text = std::to_string(v.GetValue<int64_t>());
+					break;
+				case LogicalTypeId::FLOAT: {
+					float f = v.GetValue<float>();
+					if (!std::isfinite(f))
+						Reject();
+					std::ostringstream oss;
+					oss << std::setprecision(9) << f;
+					text = oss.str();
+					break;
+				}
+				case LogicalTypeId::DOUBLE: {
+					double d = v.GetValue<double>();
+					if (!std::isfinite(d))
+						Reject();
+					std::ostringstream oss;
+					oss << std::setprecision(17) << d;
+					text = oss.str();
+					break;
+				}
+				default:
 					Reject();
-				auto text = v.GetValue<string>();
-				if (text.empty() || text.size() > 4000 || text.find('\0') != string::npos)
-					Reject();
+				}
 				values[i] = OracleODBCUTF8ToWide(text);
 				lengths[i] = (values[i].size() - 1) * sizeof(SQLWCHAR);
 			}
@@ -251,6 +297,18 @@ public:
 			                       values[i].empty() ? nullptr : values[i].data(), values[i].size() * sizeof(SQLWCHAR),
 			                       &lengths[i]));
 		}
+	}
+	int64_t Execute(const string &sql, const vector<Value> &params, bool &sent) {
+		Start();
+		Check(OracleODBCPrepareUTF8(stmt.get(), sql));
+		SQLSMALLINT count = 0;
+		Check(SQLNumParams(stmt.get(), &count));
+		if (count != params.size() || count > 2100)
+			Reject();
+		std::vector<std::vector<SQLWCHAR>> values(params.size());
+		vector<string> blobs(params.size());
+		vector<SQLLEN> lengths(params.size(), 0);
+		BindInputParams(params, values, blobs, lengths);
 
 		if (cancelled.load() || ctx.IsInterrupted()) {
 			error = "57014";
@@ -275,6 +333,69 @@ public:
 		}
 		return affected;
 	}
+	int64_t ExecuteReturning(const string &sql, const vector<Value> &params, bool &sent, string &returned_rows) {
+		Start();
+		Check(OracleODBCPrepareUTF8(stmt.get(), sql));
+		SQLSMALLINT count = 0;
+		Check(SQLNumParams(stmt.get(), &count));
+		if (count != static_cast<SQLSMALLINT>(params.size() + 1) || count > 2100)
+			Reject();
+		std::vector<std::vector<SQLWCHAR>> values(params.size());
+		vector<string> blobs(params.size());
+		vector<SQLLEN> lengths(params.size(), 0);
+		BindInputParams(params, values, blobs, lengths);
+		SQLWCHAR out_buf[128] = {};
+		SQLLEN out_len = 0;
+		Check(SQLBindParameter(stmt.get(), static_cast<SQLUSMALLINT>(params.size() + 1), SQL_PARAM_OUTPUT,
+		                       SQL_C_WCHAR, SQL_WVARCHAR, 127, 0, out_buf, sizeof(out_buf), &out_len));
+		if (cancelled.load() || ctx.IsInterrupted()) {
+			error = "57014";
+			Reject();
+		}
+		sent = true;
+		auto rc = SQLExecute(stmt.get());
+		if (rc == SQL_NO_DATA) {
+			returned_rows = "[]";
+			return 0;
+		}
+		Check(rc);
+		SQLSMALLINT cols = 0;
+		Check(SQLNumResultCols(stmt.get(), &cols));
+		if (cols != 0)
+			Reject();
+		SQLLEN affected = -1;
+		Check(SQLRowCount(stmt.get(), &affected));
+		if (affected < 0)
+			Reject();
+		if (affected == 0) {
+			returned_rows = "[]";
+		} else if (affected == 1) {
+			if (out_len == SQL_NULL_DATA || out_len <= 0 || out_len >= static_cast<SQLLEN>(sizeof(out_buf)) ||
+			    (out_len % static_cast<SQLLEN>(sizeof(SQLWCHAR))) != 0) {
+				error = "0A000";
+				Reject();
+			}
+			std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
+			auto units = static_cast<size_t>(out_len) / sizeof(SQLWCHAR);
+			std::u16string u16(reinterpret_cast<const char16_t *>(out_buf), units);
+			auto nul = u16.find(u'\0');
+			if (nul != std::u16string::npos)
+				u16.resize(nul);
+			string val = converter.to_bytes(u16);
+			if (val.empty() || val.size() > 38 || val.find_first_not_of("0123456789-") != string::npos)
+				Reject();
+			returned_rows = "[[" + JSON(val) + "]]";
+		} else {
+			error = "0A000";
+			Reject();
+		}
+		rc = SQLMoreResults(stmt.get());
+		if (rc != SQL_NO_DATA) {
+			Check(rc);
+			Reject();
+		}
+		return affected;
+	}
 
 private:
 	ClientContext &ctx;
@@ -292,6 +413,9 @@ struct Data : TableFunctionData {
 	vector<Value> params;
 	bool execute;
 	bool diagnostics = false;
+	bool returning = false;
+	string returning_name;
+	int64_t returning_oid = 0;
 	Data(ODBCCatalog &c, bool exec) : catalog(c), execute(exec) {
 	}
 };
@@ -330,6 +454,18 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 		if (d->params.size() > 2100)
 			Reject();
 	}
+	d->returning = in.table_function.GetName().GetIdentifierName() == "oracle_guarded_insert_returning";
+	if (d->returning) {
+		auto rname = in.named_parameters.find("returning_name"), roid = in.named_parameters.find("returning_oid");
+		if (rname == in.named_parameters.end() || roid == in.named_parameters.end() || rname->second.IsNull() ||
+		    roid->second.IsNull())
+			Reject();
+		d->returning_name = rname->second.GetValue<string>();
+		d->returning_oid = roid->second.GetValue<int64_t>();
+		if (!SimpleName(d->returning_name) ||
+		    (d->returning_oid != 20 && d->returning_oid != 21 && d->returning_oid != 23))
+			Reject();
+	}
 	auto diagnostic = in.named_parameters.find("source_diagnostics");
 	if (diagnostic != in.named_parameters.end()) {
 		if (diagnostic->second.IsNull())
@@ -339,6 +475,10 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 	names = {"status", "affected_rows", "sqlstate", "stage", "version", "descriptor"};
 	types = {LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::VARCHAR,
 	         LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+	if (d->returning) {
+		names.push_back("returned_rows");
+		types.push_back(LogicalType::VARCHAR);
+	}
 	if (d->diagnostics) {
 		names.push_back("source_error");
 		types.push_back(LogicalType::VARCHAR);
@@ -366,7 +506,7 @@ static string JSONRows(const vector<vector<string>> &rows) {
 	}
 	return out + "]";
 }
-static string Metadata(Session &s, const Data &d, string &stage) {
+static string Metadata(Session &s, const Data &d, string &stage, int64_t *returning_col_oid = nullptr) {
 	const auto owner = Literal(d.schema), table = Literal(d.table);
 	const auto filter = "OWNER=" + owner + " AND TABLE_NAME=" + table;
 	stage = "source_objects";
@@ -401,45 +541,49 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 	if (s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_MVIEW_LOGS WHERE LOG_OWNER=" + owner + " AND MASTER=" + table) !=
 	    "0")
 		Reject();
-	stage = "source_references";
-	auto parent_keys =
-	    s.Rows("SELECT CONSTRAINT_NAME FROM DBA_CONSTRAINTS WHERE " + filter + " AND CONSTRAINT_TYPE IN('P','U')");
-	if (parent_keys.size() > 1024)
-		Reject();
-	for (auto &key : parent_keys)
-		if (s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_CONSTRAINTS WHERE CONSTRAINT_TYPE='R' AND R_OWNER=" + owner +
-		             " AND R_CONSTRAINT_NAME=" + Literal(key[0])) != "0")
-			Reject();
 
 	stage = "source_columns";
 	auto cols = s.Rows(
 	    "SELECT "
 	    "COLUMN_NAME,DATA_TYPE,NULLABLE,TO_CHAR(COLUMN_ID),COALESCE(TO_CHAR(DATA_PRECISION),'0'),COALESCE(TO_CHAR(DATA_"
 	    "SCALE),'0'),"
-	    "TO_CHAR(DATA_LENGTH),COALESCE(TO_CHAR(CHAR_LENGTH),'0'),COALESCE(CHAR_USED,'-') "
+	    "TO_CHAR(DATA_LENGTH),COALESCE(TO_CHAR(CHAR_LENGTH),'0'),COALESCE(CHAR_USED,'-'),"
+	    "CASE WHEN COALESCE(DEFAULT_LENGTH,0)>0 THEN '1' ELSE '0' END,COALESCE(IDENTITY_COLUMN,'NO'),"
+	    "CASE WHEN DATA_SCALE=0 THEN '1' ELSE '0' END "
 	    "FROM DBA_TAB_COLS WHERE " +
 	    filter +
-	    " AND ((DATA_TYPE='NUMBER' AND DATA_PRECISION BETWEEN 1 AND 38 AND DATA_SCALE BETWEEN 0 AND DATA_PRECISION)"
-	    " OR (DATA_TYPE='VARCHAR2' AND DATA_LENGTH BETWEEN 1 AND 4000 AND CHAR_LENGTH BETWEEN 1 AND DATA_LENGTH AND "
-	    "CHAR_USED IN('B','C'))"
-	    " OR DATA_TYPE='DATE' OR (DATA_TYPE "
-	    "IN('TIMESTAMP(0)','TIMESTAMP(1)','TIMESTAMP(2)','TIMESTAMP(3)','TIMESTAMP(4)','TIMESTAMP(5)','TIMESTAMP(6)') "
-	    "AND DATA_SCALE BETWEEN 0 AND 6))"
-	    " AND DATA_TYPE_OWNER IS NULL AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO' AND IDENTITY_COLUMN='NO' AND "
-	    "DEFAULT_ON_NULL='NO' AND COALESCE(DEFAULT_LENGTH,0)=0 ORDER BY COLUMN_ID");
-	auto count = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TAB_COLS WHERE " + filter);
+	    " AND ((DATA_TYPE='NUMBER' AND (DATA_PRECISION IS NULL OR (DATA_PRECISION BETWEEN 1 AND 38 AND "
+	    "COALESCE(DATA_SCALE,0) BETWEEN -84 AND 127)))"
+	    " OR DATA_TYPE IN('BINARY_FLOAT','BINARY_DOUBLE','FLOAT')"
+	    " OR (DATA_TYPE IN('VARCHAR2','NVARCHAR2','CHAR','NCHAR') AND DATA_LENGTH BETWEEN 1 AND 4000 AND "
+	    "COALESCE(CHAR_LENGTH,DATA_LENGTH) BETWEEN 1 AND DATA_LENGTH AND COALESCE(CHAR_USED,'B') IN('B','C'))"
+	    " OR DATA_TYPE IN('CLOB','NCLOB','BLOB','DATE','TIMESTAMP','TIMESTAMP WITH TIME ZONE')"
+	    " OR (DATA_TYPE='RAW' AND DATA_LENGTH BETWEEN 1 AND 2000)"
+	    " OR (DATA_TYPE "
+	    "IN('TIMESTAMP(0)','TIMESTAMP(1)','TIMESTAMP(2)','TIMESTAMP(3)','TIMESTAMP(4)','TIMESTAMP(5)','TIMESTAMP(6)',"
+	    "'TIMESTAMP(0) WITH TIME ZONE','TIMESTAMP(1) WITH TIME ZONE','TIMESTAMP(2) WITH TIME ZONE',"
+	    "'TIMESTAMP(3) WITH TIME ZONE','TIMESTAMP(4) WITH TIME ZONE','TIMESTAMP(5) WITH TIME ZONE',"
+	    "'TIMESTAMP(6) WITH TIME ZONE') "
+	    "AND COALESCE(DATA_SCALE,6) BETWEEN 0 AND 6))"
+	    " AND DATA_TYPE_OWNER IS NULL AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO' ORDER BY COLUMN_ID");
+	auto count = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TAB_COLS WHERE " + filter +
+	                      " AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO'");
 	if (cols.empty() || cols.size() > 1024 || count != std::to_string(cols.size()))
 		Reject();
 	string charset;
 	for (auto &c : cols) {
-		if (c[1] != "VARCHAR2")
+		if (c[1] != "VARCHAR2" && c[1] != "NVARCHAR2" && c[1] != "CHAR" && c[1] != "NCHAR" &&
+		    c[1] != "CLOB" && c[1] != "NCLOB")
 			continue;
 		stage = "source_charset";
-		// Keep the existing lossless source/client charset contract for guarded
-		// VARCHAR2 writes and the narrow-character metadata reads below.
+		// Keep lossless AL32UTF8 Unicode transport. ODBC wide APIs avoid locale dependency;
+		// only reject NLS_LANG when explicitly configured to an incompatible encoding.
 		const auto lang = std::getenv("NLS_LANG");
-		if (!lang || !StringUtil::EndsWith(StringUtil::Upper(lang), ".AL32UTF8"))
-			Reject();
+		if (lang && *lang) {
+			auto upper_lang = StringUtil::Upper(lang);
+			if (!StringUtil::EndsWith(upper_lang, ".AL32UTF8") && !StringUtil::EndsWith(upper_lang, ".UTF8"))
+				Reject();
+		}
 		charset = s.Scalar("SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER='NLS_CHARACTERSET'");
 		if (charset != "AL32UTF8")
 			Reject();
@@ -454,14 +598,7 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 	for (auto &c : constraints) {
 		if (c[2] != "NOT DEFERRABLE" || c[3] != "IMMEDIATE" || c[4] != "ENABLED" || c[5] != "VALIDATED")
 			Reject();
-		if (c[1] == "C") {
-			bool notnull = false;
-			for (auto &col : cols)
-				if (col[2] == "N" && c[6] == Identifier(col[0]) + " IS NOT NULL")
-					notnull = true;
-			if (!notnull)
-				Reject();
-		} else if (c[1] != "P" && c[1] != "U")
+		if (c[1] != "P" && c[1] != "U" && c[1] != "R" && c[1] != "C")
 			Reject();
 	}
 	stage = "source_indexes";
@@ -494,11 +631,31 @@ static string Metadata(Session &s, const Data &d, string &stage) {
 			out += ",";
 		first = false;
 		auto type = c[1];
-		if (StringUtil::StartsWith(type, "TIMESTAMP("))
+		if (type.find("WITH TIME ZONE") != string::npos)
+			type = "TIMESTAMPTZ";
+		else if (StringUtil::StartsWith(type, "TIMESTAMP("))
 			type = "TIMESTAMP";
+		int64_t type_oid = 0;
+		if (c[1] == "NUMBER" && c[11] == "1") {
+			auto prec = std::stoll(c[4]);
+			if (prec == 0)
+				type_oid = 20;
+			else if (prec <= 5)
+				type_oid = 21;
+			else if (prec <= 10)
+				type_oid = 23;
+			else if (prec <= 19)
+				type_oid = 20;
+		}
+		if (returning_col_oid && c[0] == d.returning_name)
+			*returning_col_oid = type_oid;
 		out += "{\"name\":" + JSON(c[0]) + ",\"data_type\":" + JSON(type) +
-		       ",\"nullable\":" + (c[2] == "Y" ? "true" : "false") + ",\"precision\":" + c[4] + ",\"scale\":" + c[5];
-		if (type == "VARCHAR2")
+		       ",\"nullable\":" + (c[2] == "Y" ? "true" : "false") + ",\"precision\":" + c[4] + ",\"scale\":" + c[5] +
+		       ",\"has_default\":" + (c[9] == "1" ? "true" : "false") +
+		       ",\"identity\":" + (c[10] == "YES" ? "true" : "false");
+		if (type_oid != 0)
+			out += ",\"type_oid\":" + std::to_string(type_oid);
+		if (type == "VARCHAR2" || type == "NVARCHAR2" || type == "CHAR" || type == "NCHAR")
 			out += ",\"max_length\":" + c[6] + ",\"char_length\":" + c[7] + ",\"char_used\":" + JSON(c[8]) +
 			       ",\"charset\":" + JSON(charset);
 		out += "}";
@@ -543,8 +700,9 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	state.done = true;
 	auto &d = in.bind_data->Cast<Data>();
 	string status = "CONFIRMED_NOT_EXECUTED", error, stage = "source_metadata", version, descriptor;
-	string source_error;
+	string source_error, returned_rows;
 	int64_t affected = -1;
+	int64_t ret_oid = 0;
 	bool sent = false, commit_started = false, local_rejection = false;
 	ODBCPoolConnection pooled;
 	shared_ptr<ODBCConnection> connection;
@@ -580,15 +738,20 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 		stage = "source_lock";
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE WAIT 5");
 
-		descriptor = Metadata(s, d, stage);
+		descriptor = Metadata(s, d, stage, d.returning ? &ret_oid : nullptr);
 		if (d.execute) {
 			stage = "source_descriptor";
 			if (descriptor != d.expected) {
 				error = "0A000";
 				Reject();
 			}
+			if (d.returning && (ret_oid == 0 || ret_oid != d.returning_oid)) {
+				error = "0A000";
+				Reject();
+			}
 			stage = "source_execute";
-			affected = s.Execute(d.sql, d.params, sent);
+			affected = d.returning ? s.ExecuteReturning(d.sql, d.params, sent, returned_rows)
+			                       : s.Execute(d.sql, d.params, sent);
 			stage = "source_commit";
 			commit_started = true;
 			status = "COMMIT_STATUS_UNKNOWN";
@@ -645,8 +808,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	out.SetValue(3, 0, Value(stage));
 	out.SetValue(4, 0, Value(version));
 	out.SetValue(5, 0, Value(descriptor));
+	if (d.returning)
+		out.SetValue(6, 0, Value(status == "COMMITTED" ? returned_rows : ""));
 	if (d.diagnostics)
-		out.SetValue(6, 0, Value(source_error));
+		out.SetValue(6 + (d.returning ? 1 : 0), 0, Value(source_error));
 	out.SetChildCardinality(1);
 }
 
@@ -710,5 +875,14 @@ void RegisterOracleGuardedCRUD(ExtensionLoader &loader) {
 		options.Add("source_diagnostics", LogicalType::BOOLEAN);
 	});
 	loader.RegisterFunction(exec);
+	TableFunction ret("oracle_guarded_insert_returning", vector<LogicalType>(6, LogicalType::VARCHAR), Scan, Bind,
+	                  Init);
+	ret.GetSignature().WithTypedKwargs("options", [](TypedKwargs &options) {
+		options.Add("params", LogicalType::ANY);
+		options.Add("returning_name", LogicalType::VARCHAR);
+		options.Add("returning_oid", LogicalType::BIGINT);
+		options.Add("source_diagnostics", LogicalType::BOOLEAN);
+	});
+	loader.RegisterFunction(ret);
 }
 } // namespace duckdb

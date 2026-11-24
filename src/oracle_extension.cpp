@@ -19,6 +19,7 @@ using namespace duckdb;
 #ifdef ORACLE_GUARDED_CRUD
 namespace duckdb {
 void RegisterOracleGuardedCRUD(ExtensionLoader &loader);
+void RegisterOracleGuardedDDL(ExtensionLoader &loader);
 }
 #endif
 
@@ -95,6 +96,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterODBCExactNumericCollation(loader, "oracle_exact_numeric");
 #ifdef ORACLE_GUARDED_CRUD
 	RegisterOracleGuardedCRUD(loader);
+	RegisterOracleGuardedDDL(loader);
 #endif
 	// The ODBC driver manager handles Oracle driver initialization.
 	ODBCClearCacheFunction clear_cache_func;

@@ -74,4 +74,14 @@ if(SCANNER_BUILD_CAPABILITY_TESTS)
     build_loadable_extension(oracle_diagnostics_test "-no-warnings" test/oracle_metadata_diagnostics_test.cpp)
     target_include_directories(oracle_diagnostics_test_loadable_extension PRIVATE src/include)
     target_compile_definitions(oracle_diagnostics_test_loadable_extension PRIVATE ORACLE_DIAGNOSTICS_TEST_EXTENSION)
+
+    add_executable(oracle_temporal_test
+                   test/oracle_temporal_test.cpp
+                   src/odbc_utils.cpp
+                   src/odbc_filter_pushdown.cpp
+                   src/odbc_parameter.cpp
+                   src/odbc_types.cpp)
+    target_include_directories(oracle_temporal_test PRIVATE src/include)
+    target_link_libraries(oracle_temporal_test duckdb ${ODBC_LIBRARY})
+    add_test(NAME oracle_temporal COMMAND oracle_temporal_test)
 endif()

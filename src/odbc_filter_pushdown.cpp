@@ -9,32 +9,62 @@
 
 namespace duckdb {
 
-static string TransformFilterExpr(const string &column_name, const Expression &expr,
-                                  const std::function<string(ExpressionType)> &transform_cmp);
-
-static string CreateConjunctionExpr(const string &column_name, const vector<unique_ptr<Expression>> &children,
-                                    const string &op, const std::function<string(ExpressionType)> &transform_cmp) {
-	vector<string> parts;
-	for (auto &child : children) {
-		auto part = TransformFilterExpr(column_name, *child, transform_cmp);
-		if (part.empty()) {
-			return string();
-		}
-		parts.push_back(std::move(part));
-	}
-	if (parts.empty()) {
-		return string();
-	}
-	return "(" + StringUtil::Join(parts, " " + op + " ") + ")";
-}
-
 static bool IsDirectColumnRef(const Expression &expr) {
 	return expr.GetExpressionClass() == ExpressionClass::BOUND_REF ||
 	       expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF;
 }
 
-static string TransformFilterExpr(const string &column_name, const Expression &expr,
-                                  const std::function<string(ExpressionType)> &transform_cmp) {
+bool ODBCFilterPushdown::TryTransformComparison(ExpressionType type, string &out) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:
+		out = "=";
+		return true;
+	case ExpressionType::COMPARE_NOTEQUAL:
+		out = "!=";
+		return true;
+	case ExpressionType::COMPARE_LESSTHAN:
+		out = "<";
+		return true;
+	case ExpressionType::COMPARE_GREATERTHAN:
+		out = ">";
+		return true;
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		out = "<=";
+		return true;
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		out = ">=";
+		return true;
+	default:
+		out.clear();
+		return false;
+	}
+}
+
+static bool TryTransformFilterExpr(const string &column_name, const Expression &expr, string &out);
+
+static bool TryCreateConjunctionExpr(const string &column_name, const vector<unique_ptr<Expression>> &children,
+                                     const string &op, string &out) {
+	vector<string> parts;
+	for (auto &child : children) {
+		string part;
+		if (!TryTransformFilterExpr(column_name, *child, part)) {
+			out.clear();
+			return false;
+		}
+		if (part.empty()) {
+			continue;
+		}
+		parts.push_back(std::move(part));
+	}
+	if (parts.empty()) {
+		out.clear();
+		return true;
+	}
+	out = "(" + StringUtil::Join(parts, " " + op + " ") + ")";
+	return true;
+}
+
+static bool TryTransformFilterExpr(const string &column_name, const Expression &expr, string &out) {
 	if (BoundComparisonExpression::IsComparison(expr)) {
 		auto &cmp = expr.Cast<BoundFunctionExpression>();
 		auto cmp_type = cmp.GetExpressionType();
@@ -47,127 +77,172 @@ static string TransformFilterExpr(const string &column_name, const Expression &e
 			constant = &left.Cast<BoundConstantExpression>().GetValue();
 			cmp_type = FlipComparisonExpression(cmp_type);
 		} else {
-			return string();
+			out.clear();
+			return false;
 		}
-		auto constant_string = ODBCUtils::TransformConstant(*constant);
-		auto operator_string = transform_cmp(cmp_type);
-		return StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
+		string constant_string;
+		if (!ODBCUtils::TryTransformConstant(*constant, constant_string)) {
+			out.clear();
+			return false;
+		}
+		string operator_string;
+		if (!ODBCFilterPushdown::TryTransformComparison(cmp_type, operator_string)) {
+			out.clear();
+			return false;
+		}
+		out = StringUtil::Format("%s %s %s", column_name, operator_string, constant_string);
+		return true;
 	}
 	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conj = expr.Cast<BoundConjunctionExpression>();
 		auto op = conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? "AND" : "OR";
-		return CreateConjunctionExpr(column_name, conj.GetChildren(), op, transform_cmp);
+		return TryCreateConjunctionExpr(column_name, conj.GetChildren(), op, out);
 	}
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		auto &children = op.GetChildren();
 		if (children.empty() || !IsDirectColumnRef(*children[0])) {
-			return string();
+			out.clear();
+			return false;
 		}
 		switch (op.GetExpressionType()) {
 		case ExpressionType::OPERATOR_IS_NULL:
-			return column_name + " IS NULL";
+			out = column_name + " IS NULL";
+			return true;
 		case ExpressionType::OPERATOR_IS_NOT_NULL:
-			return column_name + " IS NOT NULL";
+			out = column_name + " IS NOT NULL";
+			return true;
 		case ExpressionType::COMPARE_IN: {
-			vector<Value> values;
+			if (children.size() <= 1) {
+				out.clear();
+				return false;
+			}
+			vector<string> constant_strings;
+			constant_strings.reserve(children.size() - 1);
 			for (idx_t i = 1; i < children.size(); i++) {
 				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
-					return string();
+					out.clear();
+					return false;
 				}
-				values.push_back(children[i]->Cast<BoundConstantExpression>().GetValue());
+				string constant_string;
+				if (!ODBCUtils::TryTransformConstant(children[i]->Cast<BoundConstantExpression>().GetValue(),
+				                                     constant_string)) {
+					out.clear();
+					return false;
+				}
+				constant_strings.push_back(std::move(constant_string));
 			}
 			vector<string> groups;
-			for (idx_t offset = 0; offset < values.size(); offset += 1000) {
+			for (idx_t offset = 0; offset < constant_strings.size(); offset += 1000) {
 				string in_list;
-				auto group_end = MinValue<idx_t>(offset + 1000, values.size());
+				auto group_end = MinValue<idx_t>(offset + 1000, constant_strings.size());
 				for (idx_t index = offset; index < group_end; index++) {
 					if (!in_list.empty()) {
 						in_list += ", ";
 					}
-					in_list += ODBCUtils::TransformConstant(values[index]);
+					in_list += constant_strings[index];
 				}
 				groups.push_back(column_name + " IN (" + in_list + ")");
 			}
-			return groups.size() == 1 ? groups[0] : "(" + StringUtil::Join(groups, " OR ") + ")";
+			out = groups.size() == 1 ? groups[0] : "(" + StringUtil::Join(groups, " OR ") + ")";
+			return true;
 		}
 		default:
-			return string();
+			out.clear();
+			return false;
 		}
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &func = expr.Cast<BoundFunctionExpression>();
 		if (func.Function().GetName() == OptionalFilterScalarFun::NAME && func.BindInfo()) {
 			auto &data = func.BindInfo()->Cast<OptionalFilterFunctionData>();
-			return data.child_filter_expr ? TransformFilterExpr(column_name, *data.child_filter_expr, transform_cmp)
-			                              : string();
+			if (!data.child_filter_expr) {
+				out.clear();
+				return true;
+			}
+			if (!TryTransformFilterExpr(column_name, *data.child_filter_expr, out)) {
+				// Optional pushdown hints may be safely omitted locally without changing query semantics.
+				out.clear();
+			}
+			return true;
 		}
 		if (func.Function().GetName() == SelectivityOptionalFilterScalarFun::NAME && func.BindInfo()) {
 			auto &data = func.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
-			return data.child_filter_expr ? TransformFilterExpr(column_name, *data.child_filter_expr, transform_cmp)
-			                              : string();
+			if (!data.child_filter_expr) {
+				out.clear();
+				return true;
+			}
+			if (!TryTransformFilterExpr(column_name, *data.child_filter_expr, out)) {
+				out.clear();
+			}
+			return true;
 		}
 		if (func.Function().GetName() == DynamicFilterScalarFun::NAME) {
-			return string();
+			out.clear();
+			return true;
 		}
-		return string();
+		out.clear();
+		return false;
 	}
 	default:
-		return string();
+		out.clear();
+		return false;
 	}
 }
 
-string ODBCFilterPushdown::TransformComparison(ExpressionType type) {
-	switch (type) {
-	case ExpressionType::COMPARE_EQUAL:
-		return "=";
-	case ExpressionType::COMPARE_NOTEQUAL:
-		return "!=";
-	case ExpressionType::COMPARE_LESSTHAN:
-		return "<";
-	case ExpressionType::COMPARE_GREATERTHAN:
-		return ">";
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
-		return "<=";
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
-		return ">=";
-	default:
-		throw NotImplementedException("Unsupported expression type");
-	}
-}
-
-string ODBCFilterPushdown::TransformFilter(string &column_name, TableFilter &filter) {
+bool ODBCFilterPushdown::TryTransformFilter(const string &column_name, const TableFilter &filter, string &out) {
 	if (filter.filter_type == TableFilterType::EXPRESSION_FILTER) {
 		auto &expr_filter = filter.Cast<ExpressionFilter>();
 		if (!expr_filter.expr) {
-			return string();
+			out.clear();
+			return true;
 		}
-		return TransformFilterExpr(column_name, *expr_filter.expr, TransformComparison);
+		return TryTransformFilterExpr(column_name, *expr_filter.expr, out);
 	}
-	return string();
+	out.clear();
+	return false;
+}
+
+ODBCFilterPushdownResult ODBCFilterPushdown::TransformFiltersWithFallback(const vector<column_t> &column_ids,
+                                                                          optional_ptr<TableFilterSet> filters,
+                                                                          const vector<string> &names) {
+	ODBCFilterPushdownResult res;
+	if (!filters || !filters->HasFilters()) {
+		return res;
+	}
+	for (auto &entry : *filters) {
+		auto filter_col_idx = entry.GetIndex().GetIndexUnsafe();
+		if (filter_col_idx >= column_ids.size()) {
+			res.unpushed_filter_columns.push_back(filter_col_idx);
+			continue;
+		}
+		auto col_id = column_ids[filter_col_idx];
+		if (col_id >= names.size()) {
+			res.unpushed_filter_columns.push_back(filter_col_idx);
+			continue;
+		}
+		auto column_name = ODBCUtils::WriteIdentifier(names[col_id]);
+		auto &filter = entry.Filter();
+		string new_filter;
+		if (!TryTransformFilter(column_name, filter, new_filter)) {
+			res.unpushed_filter_columns.push_back(filter_col_idx);
+			continue;
+		}
+		if (new_filter.empty()) {
+			continue;
+		}
+		if (!res.where_clause.empty()) {
+			res.where_clause += " AND ";
+		}
+		res.where_clause += new_filter;
+	}
+	return res;
 }
 
 string ODBCFilterPushdown::TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
                                             const vector<string> &names) {
-	if (!filters || !filters->HasFilters()) {
-		// no filters
-		return string();
-	}
-	string result;
-	for (auto &entry : *filters) {
-		auto column_name = ODBCUtils::WriteIdentifier(names[column_ids[entry.GetIndex().GetIndexUnsafe()]]);
-		auto &filter = entry.Filter();
-		auto new_filter = TransformFilter(column_name, const_cast<TableFilter &>(filter));
-		if (new_filter.empty()) {
-			continue;
-		}
-		if (!result.empty()) {
-			result += " AND ";
-		}
-		result += new_filter;
-	}
-	return result;
+	return TransformFiltersWithFallback(column_ids, filters, names).where_clause;
 }
 
 } // namespace duckdb

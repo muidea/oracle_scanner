@@ -135,6 +135,7 @@ public:
 
 	bool CheckConnectionHealth();
 	void ReleaseConnection();
+	void ResetSessionTemporalSettings();
 
 private:
 	unique_ptr<ODBCResult> QueryInternal(const string &query, vector<Value> params, ODBCResultStreaming streaming,

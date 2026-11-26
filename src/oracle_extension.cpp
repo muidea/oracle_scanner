@@ -5,6 +5,7 @@
 #include "odbc_scanner.hpp"
 #include "odbc_storage.hpp"
 #include "oracle_scanner_extension.hpp"
+#include "oracle_temporal_utils.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -25,6 +26,20 @@ void RegisterOracleGuardedDDL(ExtensionLoader &loader);
 
 static void SetODBCDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
 	ODBCConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
+}
+
+static void SetOracleSessionTimeZone(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidInputException("oracle_session_time_zone cannot be NULL");
+	}
+	auto tz = parameter.ToString();
+	if (!IsAllowedOracleSessionTimeZone(tz)) {
+		throw InvalidInputException(
+		    "oracle_session_time_zone must be UTC ('+00:00' or 'UTC'); set PostgreSQL/DuckDB session TimeZone for "
+		    "client display conversion (got \"%s\")",
+		    tz);
+	}
+	ODBCClearCacheFunction::ClearCacheOnSetting(context, scope, parameter);
 }
 
 template <typename Fn>
@@ -101,6 +116,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// The ODBC driver manager handles Oracle driver initialization.
 	ODBCClearCacheFunction clear_cache_func;
 	loader.RegisterFunction(clear_cache_func);
+	ODBCClearCacheScopedFunction clear_cache_scoped_func;
+	loader.RegisterFunction(clear_cache_scoped_func);
 
 	ODBCQueryFunction query_function;
 	loader.RegisterFunction(query_function);
@@ -137,7 +154,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("oracle_session_time_zone",
 	                          "Value to use as a session time zone for newly opened"
 	                          " connections to ODBC server",
-	                          LogicalType::VARCHAR, Value(""), ODBCClearCacheFunction::ClearCacheOnSetting);
+	                          LogicalType::VARCHAR, Value("+00:00"), SetOracleSessionTimeZone);
 	config.AddExtensionOption("oracle_time_as_time", "Whether or not to convert ODBC TIME columns to DuckDB TIME",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), ODBCClearCacheFunction::ClearCacheOnSetting);
 	config.AddExtensionOption("oracle_connection_limit", "Maximum number of connections per Oracle catalog",

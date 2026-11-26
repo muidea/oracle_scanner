@@ -15,14 +15,14 @@
 #include "oracle_odbc_unicode.hpp"
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <chrono>
 #include <condition_variable>
-#include <iomanip>
 #include <mutex>
-#include <sstream>
 #include <thread>
+#include <unordered_set>
 
 namespace duckdb {
 namespace {
@@ -70,6 +70,130 @@ static string Identifier(const string &s) {
 }
 static string Literal(const string &s) {
 	return ODBCUtils::WriteLiteral(s);
+}
+static string UnwrapBalancedOuterParens(const string &raw) {
+	string s = raw;
+	StringUtil::Trim(s);
+	while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+		bool in_str = false;
+		int depth = 0;
+		bool whole_wrapped = true;
+		for (idx_t i = 0; i < s.size(); i++) {
+			char c = s[i];
+			if (in_str) {
+				if (c == '\'') {
+					if (i + 1 < s.size() && s[i + 1] == '\'')
+						i++;
+					else
+						in_str = false;
+				}
+				continue;
+			}
+			if (c == '\'') {
+				in_str = true;
+			} else if (c == '(') {
+				depth++;
+			} else if (c == ')') {
+				depth--;
+				if (depth < 0)
+					return raw;
+				if (depth == 0 && i + 1 < s.size()) {
+					whole_wrapped = false;
+					break;
+				}
+			}
+		}
+		if (in_str || depth != 0 || !whole_wrapped)
+			break;
+		s = s.substr(1, s.size() - 2);
+		StringUtil::Trim(s);
+	}
+	return s;
+}
+static bool IsDigitsRange(const string &s, idx_t pos, idx_t len) {
+	if (pos + len > s.size())
+		return false;
+	for (idx_t i = 0; i < len; i++) {
+		if (!std::isdigit(static_cast<unsigned char>(s[pos + i])))
+			return false;
+	}
+	return true;
+}
+static bool IsSafeOracleDefault(const string &raw) {
+	string s = UnwrapBalancedOuterParens(raw);
+	if (s.empty() || s.size() > 1024)
+		return false;
+	const string upper = StringUtil::Upper(s);
+	if (upper == "NULL")
+		return true;
+	// Exact Oracle string literal ('...' or N'...'), rejecting empty string '' / N''
+	if (s[0] == '\'' || ((s[0] == 'N' || s[0] == 'n') && s.size() >= 2 && s[1] == '\'')) {
+		idx_t start = s[0] == '\'' ? 0 : 1;
+		if (s.size() - start <= 2 || s.size() > 1024)
+			return false;
+		for (idx_t pos = start + 1; pos < s.size(); pos++) {
+			if (s[pos] == '\0')
+				return false;
+			if (s[pos] == '\'') {
+				if (pos + 1 < s.size() && s[pos + 1] == '\'') {
+					pos++;
+					continue;
+				}
+				return pos == s.size() - 1;
+			}
+		}
+		return false;
+	}
+	// Exact DATE 'YYYY-MM-DD'
+	if (StringUtil::StartsWith(upper, "DATE") && s.size() > 5 &&
+	    (s[4] == ' ' || s[4] == '\t' || s[4] == '\r' || s[4] == '\n')) {
+		string rest = s.substr(4);
+		StringUtil::Trim(rest);
+		// Strictly 'YYYY-MM-DD'
+		if (rest.size() == 12 && rest.front() == '\'' && rest.back() == '\'' && IsDigitsRange(rest, 1, 4) &&
+		    rest[5] == '-' && IsDigitsRange(rest, 6, 2) && rest[8] == '-' && IsDigitsRange(rest, 9, 2))
+			return true;
+		return false;
+	}
+	// Exact TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.ffffff]'
+	if (StringUtil::StartsWith(upper, "TIMESTAMP") && s.size() > 10 &&
+	    (s[9] == ' ' || s[9] == '\t' || s[9] == '\r' || s[9] == '\n')) {
+		string rest = s.substr(9);
+		StringUtil::Trim(rest);
+		if (rest.size() >= 21 && rest.front() == '\'' && rest.back() == '\'' && IsDigitsRange(rest, 1, 4) &&
+		    rest[5] == '-' && IsDigitsRange(rest, 6, 2) && rest[8] == '-' && IsDigitsRange(rest, 9, 2) &&
+		    rest[11] == ' ' && IsDigitsRange(rest, 12, 2) && rest[14] == ':' && IsDigitsRange(rest, 15, 2) &&
+		    rest[17] == ':' && IsDigitsRange(rest, 18, 2)) {
+			if (rest.size() == 21)
+				return true;
+			idx_t frac = rest.size() - 22;
+			if (rest[20] == '.' && frac >= 1 && frac <= 6 && IsDigitsRange(rest, 21, frac))
+				return true;
+		}
+		return false;
+	}
+	// Exact signed integer/decimal literal
+	idx_t pos = 0;
+	if (s[pos] == '+' || s[pos] == '-') {
+		pos++;
+		s = UnwrapBalancedOuterParens(s.substr(pos));
+		pos = 0;
+	}
+	if (s.empty() || s.size() > 128)
+		return false;
+	bool seen_dot = false;
+	bool seen_digit = false;
+	for (; pos < s.size(); pos++) {
+		char c = s[pos];
+		if (std::isdigit(static_cast<unsigned char>(c))) {
+			seen_digit = true;
+		} else if (c == '.' && !seen_dot) {
+			seen_dot = true;
+		} else {
+			return false;
+		}
+	}
+	return seen_digit;
 }
 // One stable statement handle lives until the cancellation watcher is joined.
 // Never free/reassign a handle while another thread can call SQLCancelHandle.
@@ -130,14 +254,34 @@ public:
 			error = "22003";
 			break;
 		case 12899:
+		case 1461:
 			error = "22001";
 			break;
+		case 1465:
+		case 1722:
+			error = "22P02";
+			break;
+		case 1830:
 		case 1839:
+		case 1840:
 		case 1841:
 		case 1843:
 		case 1847:
+		case 1858:
 		case 1861:
+		case 1873:
+		case 1874:
+		case 1877:
+		case 1878:
+		case 1890:
 			error = "22007";
+			break;
+		case 2290:
+			error = "23514";
+			break;
+		case 2291:
+		case 2292:
+			error = "23503";
 			break;
 		case 60:
 			error = "40P01";
@@ -186,6 +330,12 @@ public:
 			Check(rc);
 	}
 	vector<vector<string>> Rows(const string &sql, bool cleanup = false) {
+		return RowsInternal(sql, cleanup, false);
+	}
+	vector<vector<string>> RowsAllowNull(const string &sql, bool cleanup = false) {
+		return RowsInternal(sql, cleanup, true);
+	}
+	vector<vector<string>> RowsInternal(const string &sql, bool cleanup, bool allow_null) {
 		Start(cleanup);
 		Check(OracleODBCExecDirectUTF8(stmt.get(), sql));
 		SQLSMALLINT cols = 0;
@@ -204,7 +354,11 @@ public:
 				char value[4096] = {0};
 				SQLLEN len = 0;
 				Check(SQLGetData(stmt.get(), col, SQL_C_CHAR, value, sizeof(value), &len));
-				if (len == SQL_NULL_DATA || len < 0 || len >= sizeof(value))
+				if (len == SQL_NULL_DATA && allow_null) {
+					row.emplace_back("");
+					continue;
+				}
+				if (len == SQL_NULL_DATA || len < 0 || len >= static_cast<SQLLEN>(sizeof(value)))
 					Reject();
 				row.emplace_back(value, static_cast<size_t>(len));
 				bytes += row.back().size();
@@ -227,37 +381,73 @@ public:
 			Reject();
 		return r[0][0];
 	}
-	void BindInputParams(const vector<Value> &params, std::vector<std::vector<SQLWCHAR>> &values, vector<string> &blobs,
-	                     vector<SQLLEN> &lengths) {
-		static char empty_blob_byte = 0;
+	struct BoundParams {
+		std::vector<std::vector<SQLWCHAR>> values;
+		vector<float> float_values;
+		vector<double> double_values;
+		vector<string> blobs;
+		vector<SQLLEN> lengths;
+	};
+	void BindPreparedInputParams(const vector<Value> &params, BoundParams &b) {
+		b.values.resize(params.size());
+		b.float_values.assign(params.size(), 0.0f);
+		b.double_values.assign(params.size(), 0.0);
+		b.blobs.resize(params.size());
+		b.lengths.assign(params.size(), 0);
 		for (idx_t i = 0; i < params.size(); i++) {
 			auto &v = params[i];
-			if (v.type().id() == LogicalTypeId::BLOB) {
-				if (v.IsNull()) {
-					lengths[i] = SQL_NULL_DATA;
-					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY, 1, 0,
-					                       &empty_blob_byte, 0, &lengths[i]));
-				} else {
-					blobs[i] = StringValue::Get(v);
-					if (blobs[i].size() > 4 * 1024 * 1024)
+			auto tid = v.type().id();
+			if (tid == LogicalTypeId::FLOAT) {
+				if (v.IsNull())
+					b.lengths[i] = SQL_NULL_DATA;
+				else {
+					b.float_values[i] = v.GetValue<float>();
+					if (!std::isfinite(b.float_values[i]))
 						Reject();
-					lengths[i] = static_cast<SQLLEN>(blobs[i].size());
-					Check(SQLBindParameter(
-					    stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY,
-					    std::max<size_t>(1, blobs[i].size()), 0,
-					    blobs[i].empty() ? &empty_blob_byte : const_cast<char *>(blobs[i].data()), blobs[i].size(),
-					    &lengths[i]));
+				}
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_FLOAT, SQL_REAL, 7, 0,
+				                       &b.float_values[i], sizeof(float), &b.lengths[i]));
+				continue;
+			}
+			if (tid == LogicalTypeId::DOUBLE) {
+				if (v.IsNull())
+					b.lengths[i] = SQL_NULL_DATA;
+				else {
+					b.double_values[i] = v.GetValue<double>();
+					if (!std::isfinite(b.double_values[i]))
+						Reject();
+				}
+				Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_DOUBLE, SQL_DOUBLE, 15, 0,
+				                       &b.double_values[i], sizeof(double), &b.lengths[i]));
+				continue;
+			}
+			if (tid == LogicalTypeId::BLOB) {
+				if (v.IsNull()) {
+					b.lengths[i] = SQL_NULL_DATA;
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_VARBINARY, 1, 0,
+					                       nullptr, 0, &b.lengths[i]));
+				} else {
+					b.blobs[i] = StringValue::Get(v);
+					if (b.blobs[i].empty() || b.blobs[i].size() > 1048576)
+						Reject();
+					b.lengths[i] = static_cast<SQLLEN>(b.blobs[i].size());
+					SQLSMALLINT sql_type = b.blobs[i].size() > 2000 ? SQL_LONGVARBINARY : SQL_VARBINARY;
+					Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_BINARY, sql_type,
+					                       b.blobs[i].size(), 0, const_cast<char *>(b.blobs[i].data()),
+					                       b.blobs[i].size(), &b.lengths[i]));
 				}
 				continue;
 			}
-			if (v.IsNull())
-				lengths[i] = SQL_NULL_DATA;
-			else {
+			SQLSMALLINT sql_type = SQL_WVARCHAR;
+			size_t units = 0;
+			if (v.IsNull()) {
+				b.lengths[i] = SQL_NULL_DATA;
+			} else {
 				string text;
-				switch (v.type().id()) {
+				switch (tid) {
 				case LogicalTypeId::VARCHAR:
 					text = v.GetValue<string>();
-					if (text.empty() || text.size() > 4000 || text.find('\0') != string::npos)
+					if (text.empty() || text.size() > 1048576 || text.find('\0') != string::npos)
 						Reject();
 					break;
 				case LogicalTypeId::BOOLEAN:
@@ -268,34 +458,18 @@ public:
 				case LogicalTypeId::BIGINT:
 					text = std::to_string(v.GetValue<int64_t>());
 					break;
-				case LogicalTypeId::FLOAT: {
-					float f = v.GetValue<float>();
-					if (!std::isfinite(f))
-						Reject();
-					std::ostringstream oss;
-					oss << std::setprecision(9) << f;
-					text = oss.str();
-					break;
-				}
-				case LogicalTypeId::DOUBLE: {
-					double d = v.GetValue<double>();
-					if (!std::isfinite(d))
-						Reject();
-					std::ostringstream oss;
-					oss << std::setprecision(17) << d;
-					text = oss.str();
-					break;
-				}
 				default:
 					Reject();
 				}
-				values[i] = OracleODBCUTF8ToWide(text);
-				lengths[i] = (values[i].size() - 1) * sizeof(SQLWCHAR);
+				b.values[i] = OracleODBCUTF8ToWide(text);
+				units = b.values[i].size() - 1;
+				b.lengths[i] = static_cast<SQLLEN>(units * sizeof(SQLWCHAR));
+				if (text.size() > 4000 || units > 4000)
+					sql_type = SQL_WLONGVARCHAR;
 			}
-			Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
-			                       std::max<size_t>(1, values[i].empty() ? 0 : values[i].size() - 1), 0,
-			                       values[i].empty() ? nullptr : values[i].data(), values[i].size() * sizeof(SQLWCHAR),
-			                       &lengths[i]));
+			Check(SQLBindParameter(stmt.get(), i + 1, SQL_PARAM_INPUT, SQL_C_WCHAR, sql_type,
+			                       std::max<size_t>(1, units), 0, b.values[i].empty() ? nullptr : b.values[i].data(),
+			                       b.values[i].size() * sizeof(SQLWCHAR), &b.lengths[i]));
 		}
 	}
 	int64_t Execute(const string &sql, const vector<Value> &params, bool &sent) {
@@ -303,12 +477,10 @@ public:
 		Check(OracleODBCPrepareUTF8(stmt.get(), sql));
 		SQLSMALLINT count = 0;
 		Check(SQLNumParams(stmt.get(), &count));
-		if (count != params.size() || count > 2100)
+		if (count != static_cast<SQLSMALLINT>(params.size()) || count > 2100)
 			Reject();
-		std::vector<std::vector<SQLWCHAR>> values(params.size());
-		vector<string> blobs(params.size());
-		vector<SQLLEN> lengths(params.size(), 0);
-		BindInputParams(params, values, blobs, lengths);
+		BoundParams b;
+		BindPreparedInputParams(params, b);
 
 		if (cancelled.load() || ctx.IsInterrupted()) {
 			error = "57014";
@@ -333,68 +505,59 @@ public:
 		}
 		return affected;
 	}
-	int64_t ExecuteReturning(const string &sql, const vector<Value> &params, bool &sent, string &returned_rows) {
+	int64_t ExecuteReturning(const string &sql, const vector<Value> &params, string &returned_rows, bool &sent) {
 		Start();
 		Check(OracleODBCPrepareUTF8(stmt.get(), sql));
 		SQLSMALLINT count = 0;
 		Check(SQLNumParams(stmt.get(), &count));
 		if (count != static_cast<SQLSMALLINT>(params.size() + 1) || count > 2100)
 			Reject();
-		std::vector<std::vector<SQLWCHAR>> values(params.size());
-		vector<string> blobs(params.size());
-		vector<SQLLEN> lengths(params.size(), 0);
-		BindInputParams(params, values, blobs, lengths);
-		SQLWCHAR out_buf[128] = {};
-		SQLLEN out_len = 0;
+		BoundParams b;
+		BindPreparedInputParams(params, b);
+		char out_buf[128] = {0};
+		SQLLEN out_ind = 0;
 		Check(SQLBindParameter(stmt.get(), static_cast<SQLUSMALLINT>(params.size() + 1), SQL_PARAM_OUTPUT,
-		                       SQL_C_WCHAR, SQL_WVARCHAR, 127, 0, out_buf, sizeof(out_buf), &out_len));
+		                       SQL_C_CHAR, SQL_VARCHAR, 128, 0, out_buf, sizeof(out_buf), &out_ind));
+
 		if (cancelled.load() || ctx.IsInterrupted()) {
 			error = "57014";
 			Reject();
 		}
 		sent = true;
 		auto rc = SQLExecute(stmt.get());
-		if (rc == SQL_NO_DATA) {
-			returned_rows = "[]";
-			return 0;
-		}
-		Check(rc);
+		if (rc != SQL_NO_DATA)
+			Check(rc);
 		SQLSMALLINT cols = 0;
 		Check(SQLNumResultCols(stmt.get(), &cols));
 		if (cols != 0)
 			Reject();
 		SQLLEN affected = -1;
 		Check(SQLRowCount(stmt.get(), &affected));
-		if (affected < 0)
+		if (affected != 1)
 			Reject();
-		if (affected == 0) {
-			returned_rows = "[]";
-		} else if (affected == 1) {
-			if (out_len == SQL_NULL_DATA || out_len <= 0 || out_len >= static_cast<SQLLEN>(sizeof(out_buf)) ||
-			    (out_len % static_cast<SQLLEN>(sizeof(SQLWCHAR))) != 0) {
-				error = "0A000";
-				Reject();
-			}
-			std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
-			auto units = static_cast<size_t>(out_len) / sizeof(SQLWCHAR);
-			std::u16string u16(reinterpret_cast<const char16_t *>(out_buf), units);
-			auto nul = u16.find(u'\0');
-			if (nul != std::u16string::npos)
-				u16.resize(nul);
-			string val = converter.to_bytes(u16);
-			if (val.empty() || val.size() > 38 || val.find_first_not_of("0123456789-") != string::npos)
-				Reject();
-			returned_rows = "[[" + JSON(val) + "]]";
-		} else {
-			error = "0A000";
-			Reject();
-		}
 		rc = SQLMoreResults(stmt.get());
 		if (rc != SQL_NO_DATA) {
 			Check(rc);
 			Reject();
 		}
-		return affected;
+		if (out_ind == SQL_NULL_DATA) {
+			returned_rows = "[[null]]";
+			return 1;
+		}
+		if (out_ind <= 0 || out_ind >= static_cast<SQLLEN>(sizeof(out_buf)))
+			Reject();
+		string val(out_buf, static_cast<size_t>(out_ind));
+		while (!val.empty() && val.back() == '\0')
+			val.pop_back();
+		StringUtil::Trim(val);
+		if (val.empty())
+			Reject();
+		idx_t pos = (val[0] == '+' || val[0] == '-') ? 1 : 0;
+		if (pos >= val.size() || val.size() - pos > 38 ||
+		    val.find_first_not_of("0123456789", pos) != string::npos)
+			Reject();
+		returned_rows = "[[" + JSON(val) + "]]";
+		return 1;
 	}
 
 private:
@@ -456,14 +619,17 @@ static unique_ptr<FunctionData> Bind(ClientContext &ctx, TableFunctionBindInput 
 	}
 	d->returning = in.table_function.GetName().GetIdentifierName() == "oracle_guarded_insert_returning";
 	if (d->returning) {
+		if (!d->execute)
+			Reject();
 		auto rname = in.named_parameters.find("returning_name"), roid = in.named_parameters.find("returning_oid");
 		if (rname == in.named_parameters.end() || roid == in.named_parameters.end() || rname->second.IsNull() ||
-		    roid->second.IsNull())
+		    rname->second.type().id() != LogicalTypeId::VARCHAR || roid->second.IsNull() ||
+		    roid->second.type().id() != LogicalTypeId::BIGINT)
 			Reject();
 		d->returning_name = rname->second.GetValue<string>();
 		d->returning_oid = roid->second.GetValue<int64_t>();
-		if (!SimpleName(d->returning_name) ||
-		    (d->returning_oid != 20 && d->returning_oid != 21 && d->returning_oid != 23))
+		if (!SimpleName(d->returning_name) || (d->returning_oid != 1700 && d->returning_oid != 20 &&
+		                                       d->returning_oid != 21 && d->returning_oid != 23))
 			Reject();
 	}
 	auto diagnostic = in.named_parameters.find("source_diagnostics");
@@ -506,7 +672,8 @@ static string JSONRows(const vector<vector<string>> &rows) {
 	}
 	return out + "]";
 }
-static string Metadata(Session &s, const Data &d, string &stage, int64_t *returning_col_oid = nullptr) {
+static string Metadata(Session &s, const Data &d, string &stage, std::unordered_set<string> *column_names = nullptr,
+                       int64_t *returning_col_oid = nullptr) {
 	const auto owner = Literal(d.schema), table = Literal(d.table);
 	const auto filter = "OWNER=" + owner + " AND TABLE_NAME=" + table;
 	stage = "source_objects";
@@ -516,16 +683,34 @@ static string Metadata(Session &s, const Data &d, string &stage, int64_t *return
 	                      owner + " AND OBJECT_NAME=" + table + " AND OBJECT_TYPE='TABLE' AND SUBOBJECT_NAME IS NULL");
 	if (objects.size() != 1 || objects[0][4] != "VALID")
 		Reject();
+	auto sys_has_column = [&](const char *tbl, const char *col) {
+		auto flag = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM ALL_TAB_COLUMNS WHERE OWNER='SYS' AND TABLE_NAME=" +
+		                     Literal(tbl) + " AND COLUMN_NAME=" + Literal(col));
+		if (flag != "0" && flag != "1")
+			Reject();
+		return flag == "1";
+	};
+	const bool has_con_id = sys_has_column("V_$LOCKED_OBJECT", "CON_ID");
+	const bool has_external_col = sys_has_column("DBA_TABLES", "EXTERNAL");
+	const bool has_identity_col = sys_has_column("DBA_TAB_COLS", "IDENTITY_COLUMN");
+	const bool has_default_on_null = sys_has_column("DBA_TAB_COLS", "DEFAULT_ON_NULL");
+	const bool has_search_condition_vc = sys_has_column("DBA_CONSTRAINTS", "SEARCH_CONDITION_VC");
 	stage = "source_locks";
-	if (s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM V$LOCKED_OBJECT WHERE OBJECT_ID=" + objects[0][0] +
-	             " AND LOCKED_MODE=6 AND SESSION_ID=TO_NUMBER(SYS_CONTEXT('USERENV','SID')) AND "
-	             "CON_ID=TO_NUMBER(SYS_CONTEXT('USERENV','CON_ID'))") == "0")
+	string lock_query = "SELECT TO_CHAR(COUNT(*)) FROM V$LOCKED_OBJECT WHERE OBJECT_ID=" + objects[0][0] +
+	                    " AND LOCKED_MODE=6 AND SESSION_ID=TO_NUMBER(SYS_CONTEXT('USERENV','SID'))";
+	if (has_con_id)
+		lock_query += " AND CON_ID=TO_NUMBER(SYS_CONTEXT('USERENV','CON_ID'))";
+	if (s.Scalar(lock_query) == "0")
 		Reject();
 	stage = "source_table";
-	auto ordinary = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TABLES WHERE " + filter +
-	                         " AND TEMPORARY='N' AND SECONDARY='N' AND NESTED='NO' AND PARTITIONED='NO' AND IOT_TYPE "
-	                         "IS NULL AND CLUSTER_NAME IS NULL AND EXTERNAL='NO' AND READ_ONLY='NO' AND DROPPED='NO'");
-	if (ordinary != "1")
+	string table_query = "SELECT TO_CHAR(COUNT(*)) FROM DBA_TABLES WHERE " + filter +
+	                     " AND TEMPORARY='N' AND SECONDARY='N' AND NESTED='NO' AND PARTITIONED='NO' AND IOT_TYPE "
+	                     "IS NULL AND CLUSTER_NAME IS NULL AND READ_ONLY='NO' AND DROPPED='NO'";
+	if (has_external_col)
+		table_query += " AND EXTERNAL='NO'";
+	if (s.Scalar(table_query) != "1")
+		Reject();
+	if (!has_external_col && s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_EXTERNAL_TABLES WHERE " + filter) != "0")
 		Reject();
 	stage = "source_triggers";
 	if (s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TRIGGERS WHERE TABLE_OWNER=" + owner +
@@ -543,58 +728,83 @@ static string Metadata(Session &s, const Data &d, string &stage, int64_t *return
 		Reject();
 
 	stage = "source_columns";
-	auto cols = s.Rows(
+	string col_query =
 	    "SELECT "
-	    "COLUMN_NAME,DATA_TYPE,NULLABLE,TO_CHAR(COLUMN_ID),COALESCE(TO_CHAR(DATA_PRECISION),'0'),COALESCE(TO_CHAR(DATA_"
-	    "SCALE),'0'),"
-	    "TO_CHAR(DATA_LENGTH),COALESCE(TO_CHAR(CHAR_LENGTH),'0'),COALESCE(CHAR_USED,'-'),"
-	    "CASE WHEN COALESCE(DEFAULT_LENGTH,0)>0 THEN '1' ELSE '0' END,COALESCE(IDENTITY_COLUMN,'NO'),"
-	    "CASE WHEN DATA_SCALE=0 THEN '1' ELSE '0' END "
+	    "COLUMN_NAME,DATA_TYPE,NULLABLE,COALESCE(TO_CHAR(COLUMN_ID),'0'),COALESCE(TO_CHAR(DATA_PRECISION),'0'),"
+	    "COALESCE(TO_CHAR(DATA_SCALE),'0'),COALESCE(TO_CHAR(DATA_LENGTH),'0'),COALESCE(TO_CHAR(CHAR_LENGTH),'0'),"
+	    "COALESCE(CHAR_USED,'-'),COALESCE(DATA_TYPE_OWNER,'-'),COALESCE(TO_CHAR(DEFAULT_LENGTH),'0')," +
+	    string(has_identity_col ? "COALESCE(IDENTITY_COLUMN,'NO')" : "'NO'") +
+	    ",DATA_DEFAULT "
 	    "FROM DBA_TAB_COLS WHERE " +
-	    filter +
-	    " AND ((DATA_TYPE='NUMBER' AND (DATA_PRECISION IS NULL OR (DATA_PRECISION BETWEEN 1 AND 38 AND "
-	    "COALESCE(DATA_SCALE,0) BETWEEN -84 AND 127)))"
-	    " OR DATA_TYPE IN('BINARY_FLOAT','BINARY_DOUBLE','FLOAT')"
-	    " OR (DATA_TYPE IN('VARCHAR2','NVARCHAR2','CHAR','NCHAR') AND DATA_LENGTH BETWEEN 1 AND 4000 AND "
-	    "COALESCE(CHAR_LENGTH,DATA_LENGTH) BETWEEN 1 AND DATA_LENGTH AND COALESCE(CHAR_USED,'B') IN('B','C'))"
-	    " OR DATA_TYPE IN('CLOB','NCLOB','BLOB','DATE','TIMESTAMP','TIMESTAMP WITH TIME ZONE')"
-	    " OR (DATA_TYPE='RAW' AND DATA_LENGTH BETWEEN 1 AND 2000)"
-	    " OR (DATA_TYPE "
-	    "IN('TIMESTAMP(0)','TIMESTAMP(1)','TIMESTAMP(2)','TIMESTAMP(3)','TIMESTAMP(4)','TIMESTAMP(5)','TIMESTAMP(6)',"
-	    "'TIMESTAMP(0) WITH TIME ZONE','TIMESTAMP(1) WITH TIME ZONE','TIMESTAMP(2) WITH TIME ZONE',"
-	    "'TIMESTAMP(3) WITH TIME ZONE','TIMESTAMP(4) WITH TIME ZONE','TIMESTAMP(5) WITH TIME ZONE',"
-	    "'TIMESTAMP(6) WITH TIME ZONE') "
-	    "AND COALESCE(DATA_SCALE,6) BETWEEN 0 AND 6))"
-	    " AND DATA_TYPE_OWNER IS NULL AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO' ORDER BY COLUMN_ID");
-	auto count = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TAB_COLS WHERE " + filter +
-	                      " AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO'");
+	    filter + " AND HIDDEN_COLUMN='NO' AND VIRTUAL_COLUMN='NO'";
+	if (has_default_on_null)
+		col_query += " AND DEFAULT_ON_NULL='NO'";
+	col_query += " ORDER BY COLUMN_ID";
+	auto cols = s.RowsAllowNull(col_query);
+	auto count = s.Scalar("SELECT TO_CHAR(COUNT(*)) FROM DBA_TAB_COLS WHERE " + filter);
 	if (cols.empty() || cols.size() > 1024 || count != std::to_string(cols.size()))
 		Reject();
-	string charset;
-	for (auto &c : cols) {
-		if (c[1] != "VARCHAR2" && c[1] != "NVARCHAR2" && c[1] != "CHAR" && c[1] != "NCHAR" &&
-		    c[1] != "CLOB" && c[1] != "NCLOB")
-			continue;
-		stage = "source_charset";
-		// Keep lossless AL32UTF8 Unicode transport. ODBC wide APIs avoid locale dependency;
-		// only reject NLS_LANG when explicitly configured to an incompatible encoding.
-		const auto lang = std::getenv("NLS_LANG");
-		if (lang && *lang) {
-			auto upper_lang = StringUtil::Upper(lang);
-			if (!StringUtil::EndsWith(upper_lang, ".AL32UTF8") && !StringUtil::EndsWith(upper_lang, ".UTF8"))
+	bool any_identity = false;
+	for (const auto &c : cols) {
+		if (c.size() != 13)
+			Reject();
+		for (idx_t idx = 0; idx < 12; idx++) {
+			if (c[idx].empty())
 				Reject();
 		}
-		charset = s.Scalar("SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER='NLS_CHARACTERSET'");
-		if (charset != "AL32UTF8")
-			Reject();
+		if (c[11] == "YES")
+			any_identity = true;
+	}
+	vector<vector<string>> identity_cols;
+	std::unordered_set<string> identity_always_cols;
+	if (any_identity) {
+		identity_cols = s.Rows("SELECT COLUMN_NAME,GENERATION_TYPE FROM DBA_TAB_IDENTITY_COLS WHERE " + filter +
+		                       " ORDER BY COLUMN_NAME");
+		for (const auto &ic : identity_cols) {
+			if (ic[1] == "ALWAYS")
+				identity_always_cols.insert(ic[0]);
+		}
+	}
+	string charset, ncharset;
+	for (auto &c : cols) {
+		if (c[9] != "-" || (c[1] != "VARCHAR2" && c[1] != "CHAR" && c[1] != "NVARCHAR2" && c[1] != "NCHAR" &&
+		                    c[1] != "CLOB" && c[1] != "NCLOB"))
+			continue;
+		stage = "source_charset";
+		// Keep the lossless source/client charset contract for guarded text writes
+		// while letting opaque columns remain unreferenced.
+		const auto lang = std::getenv("NLS_LANG");
+		auto db_charset = s.Scalar("SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER='NLS_CHARACTERSET'");
+		auto db_ncharset = s.Scalar("SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER='NLS_NCHAR_CHARACTERSET'");
+		const bool lang_ok = !lang || !*lang || StringUtil::EndsWith(StringUtil::Upper(lang), ".AL32UTF8") ||
+		                     StringUtil::EndsWith(StringUtil::Upper(lang), ".UTF8");
+		if (lang_ok) {
+			if (db_charset == "AL32UTF8")
+				charset = db_charset;
+			if (db_ncharset == "AL16UTF16" || db_ncharset == "UTF8")
+				ncharset = db_ncharset;
+		}
 		break;
 	}
 
 	stage = "source_constraints";
-	auto constraints = s.Rows(
-	    "SELECT CONSTRAINT_NAME,CONSTRAINT_TYPE,DEFERRABLE,DEFERRED,STATUS,VALIDATED,COALESCE(SEARCH_CONDITION_VC,' "
-	    "'),TO_CHAR(LAST_CHANGE,'YYYYMMDDHH24MISS') FROM DBA_CONSTRAINTS WHERE " +
-	    filter + " ORDER BY CONSTRAINT_NAME");
+	vector<vector<string>> constraints;
+	if (has_search_condition_vc) {
+		constraints = s.Rows(
+		    "SELECT CONSTRAINT_NAME,CONSTRAINT_TYPE,DEFERRABLE,DEFERRED,STATUS,VALIDATED,COALESCE(SEARCH_CONDITION_VC,"
+		    "' '),TO_CHAR(LAST_CHANGE,'YYYYMMDDHH24MISS') FROM DBA_CONSTRAINTS WHERE " +
+		    filter + " ORDER BY CONSTRAINT_NAME");
+	} else {
+		auto raw_constraints = s.RowsAllowNull(
+		    "SELECT CONSTRAINT_NAME,CONSTRAINT_TYPE,DEFERRABLE,DEFERRED,STATUS,VALIDATED,TO_CHAR(LAST_CHANGE,"
+		    "'YYYYMMDDHH24MISS'),SEARCH_CONDITION FROM DBA_CONSTRAINTS WHERE " +
+		    filter + " ORDER BY CONSTRAINT_NAME");
+		for (auto &row : raw_constraints) {
+			if (row.size() != 8)
+				Reject();
+			constraints.push_back({row[0], row[1], row[2], row[3], row[4], row[5], row[7].empty() ? " " : row[7], row[6]});
+		}
+	}
 	for (auto &c : constraints) {
 		if (c[2] != "NOT DEFERRABLE" || c[3] != "IMMEDIATE" || c[4] != "ENABLED" || c[5] != "VALIDATED")
 			Reject();
@@ -605,38 +815,75 @@ static string Metadata(Session &s, const Data &d, string &stage, int64_t *return
 	auto indexes = s.Rows("SELECT INDEX_NAME,INDEX_TYPE,UNIQUENESS,STATUS,PARTITIONED,TEMPORARY,VISIBILITY FROM "
 	                      "DBA_INDEXES WHERE TABLE_OWNER=" +
 	                      owner + " AND TABLE_NAME=" + table + " ORDER BY INDEX_NAME");
-	for (auto &i : indexes)
-		if (i[1] != "NORMAL" || i[3] != "VALID" || i[4] != "NO" || i[5] != "N" || i[6] != "VISIBLE")
+	std::unordered_set<string> lob_indexes;
+	bool need_lob_lookup = false;
+	for (auto &i : indexes) {
+		if (i[1] == "LOB") {
+			need_lob_lookup = true;
+			break;
+		}
+	}
+	if (need_lob_lookup) {
+		auto lobs = s.Rows("SELECT INDEX_NAME FROM DBA_LOBS WHERE " + filter);
+		for (auto &l : lobs)
+			lob_indexes.insert(l[0]);
+	}
+	for (auto &i : indexes) {
+		const bool ok_type = i[1] == "NORMAL" || (i[1] == "LOB" && lob_indexes.count(i[0]) > 0);
+		if (!ok_type || i[3] != "VALID" || i[4] != "NO" || i[5] != "N" || i[6] != "VISIBLE")
 			Reject();
+	}
 	auto keys = s.Rows(
 	    "SELECT INDEX_NAME,COLUMN_NAME,TO_CHAR(COLUMN_POSITION),DESCEND FROM DBA_IND_COLUMNS WHERE TABLE_OWNER=" +
 	    owner + " AND TABLE_NAME=" + table + " ORDER BY INDEX_NAME,COLUMN_POSITION");
 	auto conscols =
 	    s.Rows("SELECT CONSTRAINT_NAME,COLUMN_NAME,COALESCE(TO_CHAR(POSITION),'0') FROM DBA_CONS_COLUMNS WHERE " +
 	           filter + " ORDER BY CONSTRAINT_NAME,POSITION");
+	string single_pk_column_name;
+	for (auto &con : constraints) {
+		if (con[1] != "P")
+			continue;
+		vector<string> pk_cols;
+		for (auto &cc : conscols) {
+			if (cc[0] == con[0])
+				pk_cols.push_back(cc[1]);
+		}
+		if (pk_cols.size() == 1)
+			single_pk_column_name = pk_cols[0];
+		break;
+	}
 	stage = "source_identity";
-	auto identity = s.Rows("SELECT "
-	                       "SYS_CONTEXT('USERENV','DB_UNIQUE_NAME'),SYS_CONTEXT('USERENV','SERVICE_NAME'),SYS_CONTEXT('"
-	                       "USERENV','CON_ID') FROM DUAL");
+	auto identity = s.Rows(string("SELECT SYS_CONTEXT('USERENV','DB_UNIQUE_NAME'),SYS_CONTEXT('USERENV','SERVICE_NAME'),") +
+	                       (has_con_id ? "SYS_CONTEXT('USERENV','CON_ID')" : "'0'") + " FROM DUAL");
 	auto revision = JSONRows(identity) + JSONRows(objects) + JSONRows(cols) + JSONRows(constraints) +
-	                JSONRows(indexes) + JSONRows(keys) + JSONRows(conscols);
+	                JSONRows(indexes) + JSONRows(keys) + JSONRows(conscols) + JSONRows(identity_cols);
 	string out = "{\"database\":" + JSON(identity[0][1]) + ",\"schema\":" + JSON(d.schema) +
 	             ",\"table\":" + JSON(d.table) + ",\"object_id\":" + JSON(objects[0][0]) +
 	             ",\"revision\":" + JSON(revision) + ",\"columns\":[";
+	auto valid_int = [](const string &v) {
+		if (v.empty())
+			return false;
+		idx_t pos = v[0] == '-' ? 1 : 0;
+		return pos < v.size() && v.find_first_not_of("0123456789", pos) == string::npos;
+	};
 	bool first = true;
 	for (auto &c : cols) {
-		if (!SimpleName(c[0]))
+		if (!SimpleName(c[0]) || !valid_int(c[4]) || !valid_int(c[5]))
 			Reject();
+		if (column_names)
+			column_names->insert(c[0]);
 		if (!first)
 			out += ",";
 		first = false;
-		auto type = c[1];
-		if (type.find("WITH TIME ZONE") != string::npos)
-			type = "TIMESTAMPTZ";
-		else if (StringUtil::StartsWith(type, "TIMESTAMP("))
+		auto type = c[9] != "-" ? (c[9] + "." + c[1]) : c[1];
+		if (c[9] == "-" && type.size() == 12 && StringUtil::StartsWith(type, "TIMESTAMP(") && type[10] >= '0' &&
+		    type[10] <= '6' && type[11] == ')')
 			type = "TIMESTAMP";
+		else if (c[9] == "-" && type.size() == 27 && StringUtil::StartsWith(type, "TIMESTAMP(") && type[10] >= '0' &&
+		         type[10] <= '6' && type.substr(11) == ") WITH TIME ZONE")
+			type = "TIMESTAMP WITH TIME ZONE";
 		int64_t type_oid = 0;
-		if (c[1] == "NUMBER" && c[11] == "1") {
+		if (c[9] == "-" && c[1] == "NUMBER" && c[5] == "0") {
 			auto prec = std::stoll(c[4]);
 			if (prec == 0)
 				type_oid = 20;
@@ -650,14 +897,44 @@ static string Metadata(Session &s, const Data &d, string &stage, int64_t *return
 		if (returning_col_oid && c[0] == d.returning_name)
 			*returning_col_oid = type_oid;
 		out += "{\"name\":" + JSON(c[0]) + ",\"data_type\":" + JSON(type) +
-		       ",\"nullable\":" + (c[2] == "Y" ? "true" : "false") + ",\"precision\":" + c[4] + ",\"scale\":" + c[5] +
-		       ",\"has_default\":" + (c[9] == "1" ? "true" : "false") +
-		       ",\"identity\":" + (c[10] == "YES" ? "true" : "false");
+		       ",\"nullable\":" + (c[2] == "Y" ? "true" : "false") + ",\"precision\":" + c[4] + ",\"scale\":" + c[5];
+		const bool is_identity = (c[11] == "YES");
+		const bool identity_always = is_identity && identity_always_cols.count(c[0]) > 0;
+		if (is_identity) {
+			out += ",\"is_identity\":true";
+			if (identity_always)
+				out += ",\"identity_always\":true";
+		} else {
+			string def_trimmed = c[12];
+			StringUtil::Trim(def_trimmed);
+			const bool has_default = (c[10] != "0" || !def_trimmed.empty());
+			if (has_default) {
+				out += ",\"has_default\":true";
+				if (IsSafeOracleDefault(def_trimmed))
+					out += ",\"default_safe\":true";
+			}
+		}
 		if (type_oid != 0)
 			out += ",\"type_oid\":" + std::to_string(type_oid);
-		if (type == "VARCHAR2" || type == "NVARCHAR2" || type == "CHAR" || type == "NCHAR")
+		if (!single_pk_column_name.empty() && c[0] == single_pk_column_name)
+			out += ",\"single_column_primary_key\":true";
+		if (type == "VARCHAR2" || type == "CHAR") {
+			if (!valid_int(c[6]) || !valid_int(c[7]))
+				Reject();
 			out += ",\"max_length\":" + c[6] + ",\"char_length\":" + c[7] + ",\"char_used\":" + JSON(c[8]) +
 			       ",\"charset\":" + JSON(charset);
+		} else if (type == "NVARCHAR2" || type == "NCHAR") {
+			if (!valid_int(c[6]) || !valid_int(c[7]))
+				Reject();
+			out += ",\"max_length\":" + c[6] + ",\"char_length\":" + c[7] + ",\"char_used\":" + JSON(c[8]) +
+			       ",\"charset\":" + JSON(ncharset);
+		} else if (type == "CLOB") {
+			out += ",\"charset\":" + JSON(charset);
+		} else if (type == "RAW") {
+			if (!valid_int(c[6]))
+				Reject();
+			out += ",\"max_length\":" + c[6];
+		}
 		out += "}";
 	}
 	out += "]}";
@@ -735,23 +1012,30 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			Reject();
 		s.Exec("ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,'");
 		s.Exec("ALTER SESSION SET NLS_CALENDAR='GREGORIAN'");
+		s.Exec("ALTER SESSION SET TIME_ZONE='+00:00'");
+		s.Exec("ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT='SYYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'");
+		s.Exec("ALTER SESSION SET NLS_TIMESTAMP_FORMAT='SYYYY-MM-DD HH24:MI:SS.FF6'");
+		s.Exec("ALTER SESSION SET NLS_DATE_FORMAT='SYYYY-MM-DD HH24:MI:SS'");
 		stage = "source_lock";
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE WAIT 5");
 
-		descriptor = Metadata(s, d, stage, d.returning ? &ret_oid : nullptr);
+		std::unordered_set<string> column_names;
+		descriptor = Metadata(s, d, stage, &column_names, d.returning ? &ret_oid : nullptr);
 		if (d.execute) {
 			stage = "source_descriptor";
-			if (descriptor != d.expected) {
+			if (descriptor != d.expected || (d.returning && column_names.count(d.returning_name) != 1)) {
 				error = "0A000";
 				Reject();
 			}
-			if (d.returning && (ret_oid == 0 || ret_oid != d.returning_oid)) {
+			if (d.returning && d.returning_oid != 1700 && (ret_oid == 0 || ret_oid != d.returning_oid)) {
 				error = "0A000";
 				Reject();
 			}
 			stage = "source_execute";
-			affected = d.returning ? s.ExecuteReturning(d.sql, d.params, sent, returned_rows)
-			                       : s.Execute(d.sql, d.params, sent);
+			if (d.returning)
+				affected = s.ExecuteReturning(d.sql, d.params, returned_rows, sent);
+			else
+				affected = s.Execute(d.sql, d.params, sent);
 			stage = "source_commit";
 			commit_started = true;
 			status = "COMMIT_STATUS_UNKNOWN";
@@ -808,10 +1092,11 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 	out.SetValue(3, 0, Value(stage));
 	out.SetValue(4, 0, Value(version));
 	out.SetValue(5, 0, Value(descriptor));
+	idx_t out_col = 6;
 	if (d.returning)
-		out.SetValue(6, 0, Value(status == "COMMITTED" ? returned_rows : ""));
+		out.SetValue(out_col++, 0, Value(status == "COMMITTED" ? returned_rows : ""));
 	if (d.diagnostics)
-		out.SetValue(6 + (d.returning ? 1 : 0), 0, Value(source_error));
+		out.SetValue(out_col++, 0, Value(source_error));
 	out.SetChildCardinality(1);
 }
 

@@ -14,7 +14,12 @@
 #include <sql.h>
 #include <sqlext.h>
 
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "oracle_temporal_utils.hpp"
 
 #include "storage/odbc_schema_entry.hpp"
 #include "storage/odbc_transaction.hpp"
@@ -497,26 +502,90 @@ static string TransformBlobToOracle(const string &val) {
 	return result;
 }
 
-string ODBCUtils::TransformConstant(const Value &val) {
+bool ODBCUtils::TryTransformConstant(const Value &val, string &out) {
+	if (val.IsNull()) {
+		out = "NULL";
+		return true;
+	}
 	if (val.type().IsNumeric()) {
-		return val.ToSQLString();
+		out = val.ToSQLString();
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::BOOLEAN) {
-		return BooleanValue::Get(val) ? "1" : "0";
+		out = BooleanValue::Get(val) ? "1" : "0";
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::BLOB) {
-		return TransformBlobToOracle(StringValue::Get(val));
+		out = TransformBlobToOracle(StringValue::Get(val));
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::DATE) {
-		return "DATE " + WriteLiteral(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+		date_t d = DateValue::Get(val);
+		if (!d.IsFinite()) {
+			return false;
+		}
+		int32_t year, month, day;
+		Date::Convert(d, year, month, day);
+		if (!IsDuckDBYearInOracleRange(year)) {
+			return false;
+		}
+		int32_t ora_year = DuckDBYearToOracleYear(year);
+		out = "TO_DATE(" + WriteLiteral(FormatOracleDateSYYYY(ora_year, month, day)) + ", 'SYYYY-MM-DD')";
+		return true;
+	}
+	if (val.type().id() == LogicalTypeId::TIME) {
+		// Oracle has no native TIME data type; evaluate TIME predicates locally in DuckDB.
+		return false;
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP) {
-		return "TIMESTAMP " + WriteLiteral(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
+		timestamp_t ts = TimestampValue::Get(val);
+		if (!ts.IsFinite()) {
+			return false;
+		}
+		date_t dt;
+		dtime_t tm;
+		Timestamp::Convert(ts, dt, tm);
+		int32_t year, month, day, hour, minute, second, micros;
+		Date::Convert(dt, year, month, day);
+		if (!IsDuckDBYearInOracleRange(year)) {
+			return false;
+		}
+		Time::Convert(tm, hour, minute, second, micros);
+		int32_t ora_year = DuckDBYearToOracleYear(year);
+		out = "TO_TIMESTAMP(" + WriteLiteral(FormatOracleTimestampSYYYY(ora_year, month, day, hour, minute, second, micros)) +
+		      ", 'SYYYY-MM-DD HH24:MI:SS.FF6')";
+		return true;
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+		auto ts = timestamp_t(val.GetValueUnsafe<int64_t>());
+		if (!ts.IsFinite()) {
+			return false;
+		}
+		date_t dt;
+		dtime_t tm;
+		Timestamp::Convert(ts, dt, tm);
+		int32_t year, month, day, hour, minute, second, micros;
+		Date::Convert(dt, year, month, day);
+		if (!IsDuckDBYearInOracleRange(year)) {
+			return false;
+		}
+		Time::Convert(tm, hour, minute, second, micros);
+		int32_t ora_year = DuckDBYearToOracleYear(year);
+		out = "TO_TIMESTAMP_TZ(" +
+		      WriteLiteral(FormatOracleTimestampTZSYYYY(ora_year, month, day, hour, minute, second, micros)) +
+		      ", 'SYYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')";
+		return true;
 	}
-	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	out = val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+	return true;
+}
+
+string ODBCUtils::TransformConstant(const Value &val) {
+	string result;
+	if (!TryTransformConstant(val, result)) {
+		throw ConversionException("Value cannot be pushed to Oracle: %s", val.ToString());
+	}
+	return result;
 }
 
 } // namespace duckdb

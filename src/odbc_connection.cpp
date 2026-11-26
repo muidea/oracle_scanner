@@ -11,6 +11,7 @@
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
 #include "oracle_odbc_unicode.hpp"
+#include "oracle_temporal_utils.hpp"
 
 #include <cstdlib>
 #include <mutex>
@@ -74,7 +75,13 @@ shared_ptr<ODBCConnection> ODBCConnection::Open(ODBCTypeConfig type_config, cons
 	SQLHENV env = SQL_NULL_HENV;
 	SQLHDBC dbc = ODBCUtils::Connect(connection_string, env);
 	auto owned_connection = make_shared_ptr<OwnedODBCConnection>(dbc, env);
-	return make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
+	auto conn = make_shared_ptr<ODBCConnection>(std::move(owned_connection), connection_string, std::move(type_config));
+	conn->ResetSessionTemporalSettings();
+	return conn;
+}
+
+void ODBCConnection::ResetSessionTemporalSettings() {
+	Execute(ORACLE_SESSION_TEMPORAL_SQL);
 }
 
 idx_t ODBCConnection::ODBCExecute(SQLHSTMT stmt, const string &query, vector<Value> params, bool streaming,

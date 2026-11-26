@@ -9,7 +9,7 @@ using namespace duckdb;
 // Exercise the production diagnostic object inside a real DuckDB binder.
 // ODBC transport mocks cannot detect execution-only ClientContext access here.
 static unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	OracleMetadataPhases phases {"catalog", "owner", input.inputs[0].GetValue<string>(), 1};
 	phases.SetSQL("SELECT 'diagnostic\\\"\\n' FROM source_catalog");
 	phases.query.connection_id = 17;

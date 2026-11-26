@@ -6,26 +6,27 @@
 
 #include "odbc_result.hpp"
 #include "odbc_types.hpp"
+#include "oracle_temporal_utils.hpp"
 #include "storage/odbc_catalog.hpp"
 
 namespace duckdb {
 
 ODBCTransaction::ODBCTransaction(ODBCCatalog &odbc_catalog, TransactionManager &manager, ClientContext &context)
     : Transaction(manager, context), odbc_catalog(odbc_catalog), access_mode(odbc_catalog.access_mode) {
-	// 从连接池获取连接
-	if (!odbc_catalog.GetConnectionPool().TryGetConnection(pool_connection)) {
-		throw IOException("Failed to get connection from ODBC connection pool");
-	}
-
-	string time_zone;
-	{
-		Value odbc_session_time_zone;
-		if (context.TryGetCurrentSetting("oracle_session_time_zone", odbc_session_time_zone)) {
-			time_zone = odbc_session_time_zone.ToString();
+	Value odbc_session_time_zone;
+	if (context.TryGetCurrentSetting("oracle_session_time_zone", odbc_session_time_zone) &&
+	    !odbc_session_time_zone.IsNull()) {
+		auto time_zone = odbc_session_time_zone.ToString();
+		if (!IsAllowedOracleSessionTimeZone(time_zone)) {
+			throw InvalidInputException(
+			    "oracle_session_time_zone must be UTC ('+00:00' or 'UTC'); set PostgreSQL/DuckDB session TimeZone for "
+			    "client display conversion (got \"%s\")",
+			    time_zone);
 		}
 	}
-	if (!time_zone.empty()) {
-		pool_connection.GetConnection()->Execute("ALTER SESSION SET TIME_ZONE = " + ODBCUtils::WriteLiteral(time_zone));
+	// 从连接池获取连接 (Oracle sessions are pinned to UTC '+00:00' on Open and ReturnConnection)
+	if (!odbc_catalog.GetConnectionPool().TryGetConnection(pool_connection)) {
+		throw IOException("Failed to get connection from ODBC connection pool");
 	}
 }
 

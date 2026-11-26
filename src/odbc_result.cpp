@@ -4,10 +4,12 @@
 #include "oracle_sparse_metadata.hpp"
 #include "storage/odbc_connection_pool.hpp"
 
+#include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/hugeint.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "odbc_types.hpp"
+#include "oracle_temporal_utils.hpp"
 #include "odbc_exact_numeric.hpp"
 #include "duckdb/common/operator/decimal_cast_operators.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
@@ -175,8 +177,14 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		field.odbc_type = data_type;
 		field.c_type = ODBCTypes::GetCType(data_type);
 		auto lower_type_name = StringUtil::Lower(type_name);
+		bool is_time_source = (lower_type_name == "time" || data_type == SQL_TIME || data_type == SQL_TYPE_TIME);
 		if (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
 			// Preserve full fractional seconds and timezone offset text via SQL_C_CHAR.
+			field.c_type = SQL_C_CHAR;
+		} else if (field.duckdb_type.id() == LogicalTypeId::DATE) {
+			field.c_type = SQL_C_TYPE_DATE;
+		} else if (field.duckdb_type.id() == LogicalTypeId::TIME ||
+		           (field.duckdb_type.id() == LogicalTypeId::VARCHAR && is_time_source)) {
 			field.c_type = SQL_C_CHAR;
 		} else if (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP) {
 			field.c_type = SQL_C_TYPE_TIMESTAMP;
@@ -201,7 +209,9 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 
 		// Resize buffer based on ODBC type
 		size_t buf_size = GetBufferSize(field.c_type, column_size);
-		if (field.c_type == SQL_C_CHAR && field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+		if (field.c_type == SQL_C_CHAR &&
+		    (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ || field.duckdb_type.id() == LogicalTypeId::TIME ||
+		     is_time_source)) {
 			buf_size = MaxValue<size_t>(buf_size, DEFAULT_BIND_BUFFER_SIZE);
 		}
 		field.bind_buffer.resize(buf_size);
@@ -802,15 +812,23 @@ const vector<ODBCField> &ODBCResult::Fields() {
 	return fields;
 }
 
-// ODBC TIME values use SQL_TIMESTAMP_STRUCT
 static void WriteTimeAsString(ODBCField &f, Vector &vec, idx_t row) {
-
-	SQL_TIMESTAMP_STRUCT *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
-	if (ts->hour == 0 && ts->minute == 0 && ts->second == 0) {
-		FlatVector::SetNull(vec, row, true);
-		return;
+	dtime_t tm;
+	if (f.c_type == SQL_C_TYPE_TIME) {
+		if (f.bind_buffer.size() < sizeof(SQL_TIME_STRUCT)) {
+			throw ConversionException("ODBC TIME buffer too small for column %s", f.name);
+		}
+		auto *time_value = reinterpret_cast<SQL_TIME_STRUCT *>(f.bind_buffer.data());
+		tm = Time::FromTime(time_value->hour, time_value->minute, time_value->second, 0);
+	} else if (f.c_type == SQL_C_TYPE_TIMESTAMP) {
+		if (f.bind_buffer.size() < sizeof(SQL_TIMESTAMP_STRUCT)) {
+			throw ConversionException("ODBC TIMESTAMP buffer too small for TIME column %s", f.name);
+		}
+		auto *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
+		tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+	} else {
+		throw ConversionException("Unsupported ODBC C type %d for TIME column %s", f.c_type, f.name);
 	}
-	dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
 	string time_str = Time::ToString(tm);
 	string_t st(time_str.c_str(), time_str.length());
 	auto data = FlatVector::GetData<string_t>(vec);
@@ -873,7 +891,8 @@ static void WriteDoubleFromString(ODBCField &f, Vector &vec, idx_t row) {
 static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 	D_ASSERT(vec.GetType().id() == LogicalTypeId::VARCHAR || vec.GetType().id() == LogicalTypeId::BLOB);
 
-	if (f.odbc_type == SQL_TIME || f.odbc_type == SQL_TYPE_TIME) {
+	if ((f.odbc_type == SQL_TIME || f.odbc_type == SQL_TYPE_TIME) &&
+	    (f.c_type == SQL_C_TYPE_TIME || f.c_type == SQL_C_TYPE_TIMESTAMP)) {
 		WriteTimeAsString(f, vec, row);
 		return;
 	}
@@ -957,101 +976,133 @@ static void WriteNumber(ODBCField &f, Vector &vec, idx_t row) {
 	data[row] = num;
 }
 
-static string NormalizeTimestampTZText(string text) {
-	StringUtil::Trim(text);
-	auto date_time_sep = text.find_first_of(" T");
-	if (date_time_sep == string::npos) {
-		return text;
-	}
-	auto offset_pos = text.find_first_of("+-Zz", date_time_sep + 1);
-	if (offset_pos == string::npos) {
-		return text;
-	}
-	auto prefix = text.substr(0, offset_pos);
-	StringUtil::Trim(prefix);
-	auto suffix = text.substr(offset_pos);
-	StringUtil::Trim(suffix);
-	if (suffix == "z" || suffix == "Z") {
-		return prefix + "Z";
-	}
-	if ((suffix[0] == '+' || suffix[0] == '-') && suffix.size() >= 2 &&
-	    std::isdigit(static_cast<unsigned char>(suffix[1])) &&
-	    (suffix.size() == 2 || !std::isdigit(static_cast<unsigned char>(suffix[2])))) {
-		suffix.insert(1, 1, '0');
-	}
-	return prefix + suffix;
-}
-
 static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
-	if (vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ && f.c_type == SQL_C_CHAR) {
+	if (vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ) {
+		if (f.c_type != SQL_C_CHAR) {
+			throw ConversionException("Unsupported ODBC C type %d for TIMESTAMP_TZ column %s (offset required)",
+			                          f.c_type, f.name);
+		}
 		if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
 			throw ConversionException("ODBC TIMESTAMP_TZ value has an invalid transfer length");
 		}
 		auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
 		string text(f.ValueData(), text_len);
-		auto normalized = NormalizeTimestampTZText(std::move(text));
-		timestamp_t ts_val;
-		bool has_offset = false;
-		string_t tz(nullptr, 0);
-		if (Timestamp::TryConvertTimestampTZ(normalized.c_str(), normalized.size(), ts_val, true, has_offset, tz) !=
-		        TimestampCastResult::SUCCESS ||
-		    !has_offset || tz.GetSize() != 0) {
-			throw ConversionException("Invalid ODBC TIMESTAMP WITH TIME ZONE value: \"%s\"", normalized);
+		timestamp_tz_t parsed_tz;
+		// Oracle ODBC raw SQLGetData for TSTZ/TSLTZ omits the offset suffix under pinned SESSIONTIMEZONE='+00:00'.
+		if (!ParseOracleTimestampTZText(text, true, parsed_tz)) {
+			throw ConversionException("Invalid ODBC TIMESTAMP WITH TIME ZONE value: \"%s\"", text);
 		}
-		FlatVector::GetData<timestamp_tz_t>(vec)[row] = timestamp_tz_t(ts_val.value);
+		FlatVector::GetData<timestamp_tz_t>(vec)[row] = parsed_tz;
 		return;
 	}
 
-	D_ASSERT(f.bind_buffer.size() >= sizeof(SQL_TIMESTAMP_STRUCT));
-	SQL_TIMESTAMP_STRUCT *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
+	if (vec.GetType().id() == LogicalTypeId::DATE) {
+		if (f.c_type == SQL_C_TYPE_DATE) {
+			if (f.bind_buffer.size() < sizeof(SQL_DATE_STRUCT)) {
+				throw ConversionException("ODBC DATE buffer too small for column %s", f.name);
+			}
+			auto *ds = reinterpret_cast<SQL_DATE_STRUCT *>(f.bind_buffer.data());
+			if (ds->year == 0 && ds->month == 0 && ds->day == 0) {
+				FlatVector::SetNull(vec, row, true);
+				return;
+			}
+			FlatVector::GetData<date_t>(vec)[row] = Date::FromDate(OracleYearToDuckDBYear(ds->year), ds->month, ds->day);
+			return;
+		}
+		if (f.c_type == SQL_C_TYPE_TIMESTAMP) {
+			if (f.bind_buffer.size() < sizeof(SQL_TIMESTAMP_STRUCT)) {
+				throw ConversionException("ODBC TIMESTAMP buffer too small for DATE column %s", f.name);
+			}
+			auto *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
+			if (ts->year == 0 && ts->month == 0 && ts->day == 0) {
+				FlatVector::SetNull(vec, row, true);
+				return;
+			}
+			FlatVector::GetData<date_t>(vec)[row] = Date::FromDate(OracleYearToDuckDBYear(ts->year), ts->month, ts->day);
+			return;
+		}
+		if (f.c_type == SQL_C_CHAR) {
+			if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+				throw ConversionException("ODBC DATE value has an invalid transfer length");
+			}
+			auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
+			string text(f.ValueData(), text_len);
+			StringUtil::Trim(text);
+			if (text.size() >= 10 && text[0] == '-' && std::isdigit(static_cast<unsigned char>(text[1]))) {
+				text = text.substr(1) + " (BC)";
+			}
+			idx_t pos = 0;
+			bool special = false;
+			date_t dd;
+			if (Date::TryConvertDate(text.c_str(), text.size(), pos, dd, special, false) != DateCastResult::SUCCESS ||
+			    pos != text.size() || special) {
+				throw ConversionException("Invalid ODBC DATE value: \"%s\"", text);
+			}
+			FlatVector::GetData<date_t>(vec)[row] = dd;
+			return;
+		}
+		throw ConversionException("Unsupported ODBC C type %d for DATE column %s", f.c_type, f.name);
+	}
 
-	// Check for null/zero values
+	if (vec.GetType().id() == LogicalTypeId::TIME) {
+		if (f.c_type == SQL_C_CHAR) {
+			if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+				throw ConversionException("ODBC TIME value has an invalid transfer length");
+			}
+			auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
+			string text(f.ValueData(), text_len);
+			StringUtil::Trim(text);
+			idx_t pos = 0;
+			dtime_t tm;
+			if (!Time::TryConvertTime(text.c_str(), text.size(), pos, tm, true)) {
+				throw ConversionException("Invalid ODBC TIME value: \"%s\"", text);
+			}
+			FlatVector::GetData<dtime_t>(vec)[row] = tm;
+			return;
+		}
+		if (f.c_type == SQL_C_TYPE_TIME) {
+			if (f.bind_buffer.size() < sizeof(SQL_TIME_STRUCT)) {
+				throw ConversionException("ODBC TIME buffer too small for column %s", f.name);
+			}
+			auto *tv = reinterpret_cast<SQL_TIME_STRUCT *>(f.bind_buffer.data());
+			FlatVector::GetData<dtime_t>(vec)[row] = Time::FromTime(tv->hour, tv->minute, tv->second, 0);
+			return;
+		}
+		if (f.c_type == SQL_C_TYPE_TIMESTAMP) {
+			if (f.bind_buffer.size() < sizeof(SQL_TIMESTAMP_STRUCT)) {
+				throw ConversionException("ODBC TIMESTAMP buffer too small for TIME column %s", f.name);
+			}
+			auto *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
+			if (ts->hour < 0 || ts->hour > 24 ||
+			    (ts->hour == 24 && (ts->minute > 0 || ts->second > 0 || ts->fraction > 0))) {
+				throw BinderException("time field value out of range, hour value: " + std::to_string(ts->hour));
+			}
+			FlatVector::GetData<dtime_t>(vec)[row] =
+			    Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+			return;
+		}
+		throw ConversionException("Unsupported ODBC C type %d for TIME column %s", f.c_type, f.name);
+	}
+
+	if (vec.GetType().id() != LogicalTypeId::TIMESTAMP) {
+		throw InternalException("Unsupported date/time type: " + vec.GetType().ToString());
+	}
+	if (f.c_type != SQL_C_TYPE_TIMESTAMP) {
+		throw ConversionException("Unsupported ODBC C type %d for TIMESTAMP column %s", f.c_type, f.name);
+	}
+	if (f.bind_buffer.size() < sizeof(SQL_TIMESTAMP_STRUCT)) {
+		throw ConversionException("ODBC TIMESTAMP buffer too small for column %s", f.name);
+	}
+	SQL_TIMESTAMP_STRUCT *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());
 	if ((ts->year == 0 && ts->month == 0 && ts->day == 0 && ts->hour == 0 && ts->minute == 0 && ts->second == 0 &&
 	     ts->fraction == 0) ||
-	    (f.odbc_type == SQL_TYPE_TIME && ts->hour == 0 && ts->minute == 0 && ts->second == 0) ||
-	    (f.odbc_type == SQL_TYPE_DATE && ts->year == 0 && ts->month == 0 && ts->day == 0)) {
+	    (ts->year == 0 && ts->month == 0 && ts->day == 0)) {
 		FlatVector::SetNull(vec, row, true);
 		return;
 	}
-
-	switch (vec.GetType().id()) {
-	case LogicalTypeId::DATE: {
-		date_t val = Date::FromDate(ts->year, ts->month, ts->day);
-		date_t *data = FlatVector::GetData<date_t>(vec);
-		data[row] = val;
-		break;
-	}
-	case LogicalTypeId::TIME: {
-		if (ts->hour < 0 || ts->hour > 24 ||
-		    (ts->hour == 24 && (ts->minute > 0 || ts->second > 0 || ts->fraction > 0))) {
-			throw BinderException("time field value out of range, hour value: " + std::to_string(ts->hour));
-		}
-		dtime_t val = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
-		dtime_t *data = FlatVector::GetData<dtime_t>(vec);
-		data[row] = val;
-		break;
-	}
-	case LogicalTypeId::TIMESTAMP: {
-		date_t dt = Date::FromDate(ts->year, ts->month, ts->day);
-		dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
-		timestamp_t val = Timestamp::FromDatetime(dt, tm);
-		timestamp_t *data = FlatVector::GetData<timestamp_t>(vec);
-		data[row] = val;
-		break;
-	}
-	case LogicalTypeId::TIMESTAMP_TZ: {
-		// For ODBC, timezone information is not directly available in SQL_TIMESTAMP_STRUCT
-		// We assume local time and convert accordingly
-		date_t dt = Date::FromDate(ts->year, ts->month, ts->day);
-		dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
-		timestamp_t val = Timestamp::FromDatetime(dt, tm);
-		timestamp_tz_t *data = FlatVector::GetData<timestamp_tz_t>(vec);
-		data[row] = timestamp_tz_t(val.value);
-		break;
-	}
-	default:
-		throw InternalException("Unsupported date/time type: " + vec.GetType().ToString());
-	}
+	date_t dt = Date::FromDate(OracleYearToDuckDBYear(ts->year), ts->month, ts->day);
+	dtime_t tm = Time::FromTime(ts->hour, ts->minute, ts->second, ts->fraction / 1000);
+	FlatVector::GetData<timestamp_t>(vec)[row] = Timestamp::FromDatetime(dt, tm);
 }
 
 void ODBCResult::WriteToChunk(DataChunk &chunk, idx_t row) {

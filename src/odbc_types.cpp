@@ -23,10 +23,9 @@ LogicalType ODBCTypes::TypeToLogicalType(const ODBCTypeConfig &type_config, cons
 	auto type_name = StringUtil::Lower(type_info.type_name);
 	StringUtil::Trim(type_name);
 
-	if (StringUtil::Contains(type_name, "with local time zone")) {
-		return LogicalType::VARCHAR;
-	}
-	if (StringUtil::Contains(type_name, "timestamp") && StringUtil::Contains(type_name, "with time zone")) {
+	if (StringUtil::Contains(type_name, "timestamp") &&
+	    (StringUtil::Contains(type_name, "with time zone") ||
+	     StringUtil::Contains(type_name, "with local time zone"))) {
 		return LogicalType::TIMESTAMP_TZ;
 	}
 	if (StringUtil::Contains(type_name, "timestamp")) {

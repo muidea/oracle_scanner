@@ -7,11 +7,15 @@
 #include "storage/odbc_connection_pool.hpp"
 #include "storage/odbc_table_set.hpp"
 #include "odbc_filter_pushdown.hpp"
+#include "oracle_temporal_utils.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "oracle_metadata_diagnostics.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -46,40 +50,20 @@ struct ODBCLocalState : public LocalTableFunctionState {
 };
 
 struct ODBCGlobalState : public GlobalTableFunctionState {
-	explicit ODBCGlobalState(unique_ptr<ODBCResult> result_p) : result(std::move(result_p)) {
+	explicit ODBCGlobalState(unique_ptr<ODBCResult> result_p, unique_ptr<Expression> local_filter_expr_p = nullptr,
+	                         unique_ptr<ExpressionExecutor> local_filter_executor_p = nullptr)
+	    : result(std::move(result_p)), local_filter_expr(std::move(local_filter_expr_p)),
+	      local_filter_executor(std::move(local_filter_executor_p)) {
 	}
 
 	unique_ptr<ODBCResult> result;
+	unique_ptr<Expression> local_filter_expr;
+	unique_ptr<ExpressionExecutor> local_filter_executor;
 
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
-
-static string NormalizeTimestampTZText(string text) {
-	StringUtil::Trim(text);
-	auto date_time_sep = text.find_first_of(" T");
-	if (date_time_sep == string::npos) {
-		return text;
-	}
-	auto offset_pos = text.find_first_of("+-Zz", date_time_sep + 1);
-	if (offset_pos == string::npos) {
-		return text;
-	}
-	auto prefix = text.substr(0, offset_pos);
-	StringUtil::Trim(prefix);
-	auto suffix = text.substr(offset_pos);
-	StringUtil::Trim(suffix);
-	if (suffix == "z" || suffix == "Z") {
-		return prefix + "Z";
-	}
-	if ((suffix[0] == '+' || suffix[0] == '-') && suffix.size() >= 2 &&
-	    std::isdigit(static_cast<unsigned char>(suffix[1])) &&
-	    (suffix.size() == 2 || !std::isdigit(static_cast<unsigned char>(suffix[2])))) {
-		suffix.insert(1, 1, '0');
-	}
-	return prefix + suffix;
-}
 
 static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx_t count, string &error) {
 	if (res_vec.GetType().id() != LogicalTypeId::VARCHAR || output_vec.GetType().id() != LogicalTypeId::TIMESTAMP_TZ) {
@@ -94,17 +78,12 @@ static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx
 		}
 		auto s = src[r];
 		string raw(s.GetData(), s.GetSize());
-		string normalized = NormalizeTimestampTZText(raw);
-		timestamp_t parsed_ts;
-		bool has_offset = false;
-		string_t tz(nullptr, 0);
-		if (Timestamp::TryConvertTimestampTZ(normalized.c_str(), normalized.size(), parsed_ts, true, has_offset, tz) !=
-		        TimestampCastResult::SUCCESS ||
-		    !has_offset || tz.GetSize() != 0) {
+		timestamp_tz_t parsed_tz;
+		if (!ParseOracleTimestampTZText(raw, false, parsed_tz)) {
 			error = StringUtil::Format("invalid timestamp field format: \"%s\"", raw);
 			return false;
 		}
-		dst[r] = timestamp_tz_t(parsed_ts.value);
+		dst[r] = parsed_tz;
 	}
 	error.clear();
 	return true;
@@ -117,6 +96,9 @@ static unique_ptr<FunctionData> ODBCBind(ClientContext &context, TableFunctionBi
 
 static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ODBCBindData>();
+	auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
+	auto pushdown = ODBCFilterPushdown::TransformFiltersWithFallback(input.column_ids, input.filters, filter_names);
+
 	// generate the SELECT statement
 	string select;
 	select += "SELECT ";
@@ -138,9 +120,9 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 			}
 			auto quoted = ODBCUtils::WriteIdentifier(col_name);
 			if (col.Type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-				// Oracle ODBC describes TIMESTAMP WITH TIME ZONE as TIMESTAMP WITH LOCAL TIME ZONE
-				// and strips the offset via SESSIONTIMEZONE unless explicitly formatted with TZH:TZM.
-				select += "TO_CHAR(" + quoted + ", 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')";
+				// Oracle ODBC describes TSTZ/TSLTZ inconsistently and omits offsets/BC sign unless formatted
+				// explicitly at UTC ('+00:00') with SYYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM.
+				select += "TO_CHAR(" + quoted + " AT TIME ZONE '+00:00', 'SYYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')";
 			} else {
 				select += quoted;
 			}
@@ -150,13 +132,11 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 	select += ODBCUtils::WriteIdentifier(bind_data.table.schema.name);
 	select += ".";
 	select += ODBCUtils::WriteIdentifier(bind_data.table.name);
-	auto &filter_names = bind_data.remote_names.empty() ? bind_data.names : bind_data.remote_names;
-	string filter_string = ODBCFilterPushdown::TransformFilters(input.column_ids, input.filters, filter_names);
-	if (!filter_string.empty()) {
-		select += " WHERE (" + filter_string + ")";
+	if (!pushdown.where_clause.empty()) {
+		select += " WHERE (" + pushdown.where_clause + ")";
 	}
-	if (!bind_data.limit.empty()) {
-		select += filter_string.empty() ? " WHERE " : " AND ";
+	if (!bind_data.limit.empty() && pushdown.unpushed_filter_columns.empty()) {
+		select += pushdown.where_clause.empty() ? " WHERE " : " AND ";
 		select += "ROWNUM <= " + bind_data.limit;
 	}
 
@@ -172,9 +152,46 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 		                        bind_data.table.schema.name.c_str(), bind_data.table.name.c_str());
 	}
 
-	auto result = make_uniq<ODBCGlobalState>(std::move(query_result));
+	unique_ptr<Expression> local_filter_expr;
+	unique_ptr<ExpressionExecutor> local_filter_executor;
+	if (!pushdown.unpushed_filter_columns.empty() && input.filters) {
+		vector<unique_ptr<Expression>> local_exprs;
+		for (auto filter_col_idx : pushdown.unpushed_filter_columns) {
+			if (filter_col_idx >= input.column_ids.size()) {
+				continue;
+			}
+			auto it = input.filters->filters.find(filter_col_idx);
+			if (it == input.filters->filters.end()) {
+				continue;
+			}
+			auto col_id = input.column_ids[filter_col_idx];
+			if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
+				continue;
+			}
+			auto col_type = col_id < bind_data.types.size() ? bind_data.types[col_id]
+			                                                : bind_data.table.GetColumn(LogicalIndex(col_id)).GetType();
+			auto col_ref = make_uniq<BoundReferenceExpression>(col_type, filter_col_idx);
+			auto expr = it->second->ToExpression(*col_ref);
+			if (expr) {
+				local_exprs.push_back(std::move(expr));
+			}
+		}
+		if (local_exprs.size() == 1) {
+			local_filter_expr = std::move(local_exprs[0]);
+		} else if (local_exprs.size() > 1) {
+			auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+			for (auto &expr : local_exprs) {
+				conjunction->children.push_back(std::move(expr));
+			}
+			local_filter_expr = std::move(conjunction);
+		}
+		if (local_filter_expr) {
+			local_filter_executor = make_uniq<ExpressionExecutor>(context, *local_filter_expr);
+		}
+	}
 
-	return std::move(result);
+	return make_uniq<ODBCGlobalState>(std::move(query_result), std::move(local_filter_expr),
+	                                  std::move(local_filter_executor));
 }
 
 static unique_ptr<LocalTableFunctionState> ODBCInitLocalState(ExecutionContext &context, TableFunctionInitInput &input,
@@ -189,58 +206,83 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 		throw InternalException("ODBCScan: result pointer is null");
 	}
 
-	DataChunk &res_chunk = gstate.result->NextChunk();
+	while (true) {
+		DataChunk &res_chunk = gstate.result->NextChunk();
 
-	// 空结果集，设置输出为空
-	if (res_chunk.size() == 0) {
-		output.SetCardinality(0);
+		// 空结果集，设置输出为空
+		if (res_chunk.size() == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+
+		// 没有列的结果集，设置输出为空
+		if (res_chunk.ColumnCount() == 0) {
+			output.SetCardinality(0);
+			return;
+		}
+
+		// 检查列数匹配
+		if (output.ColumnCount() != res_chunk.ColumnCount()) {
+			throw InternalException("ODBCScan: column count mismatch. Output has %lu columns, result has %lu columns",
+			                        output.ColumnCount(), res_chunk.ColumnCount());
+		}
+
+		string error;
+		for (idx_t c = 0; c < output.ColumnCount(); c++) {
+			Vector &output_vec = output.data[c];
+			Vector &res_vec = res_chunk.data[c];
+			error.clear();
+
+			// 检查向量有效性
+			if (output_vec.GetType().id() == LogicalTypeId::INVALID) {
+				throw InternalException("ODBCScan: output vector %lu has invalid type", c);
+			}
+			if (res_vec.GetType().id() == LogicalTypeId::INVALID) {
+				throw InternalException("ODBCScan: result vector %lu has invalid type", c);
+			}
+
+			if (res_vec.GetType() == output_vec.GetType()) {
+				// A same-type TryCast is DuckDB's NopCast and only references the
+				// source vector. Materialized ODBC chunks are owned by the function
+				// state, so the output must receive an independent copy.
+				VectorOperations::Copy(res_vec, output_vec, res_chunk.size(), 0, 0);
+			} else if (res_vec.GetType().id() == LogicalTypeId::VARCHAR &&
+			           output_vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ) {
+				TryCastDateTimeOffsetVector(res_vec, output_vec, res_chunk.size(), error);
+			} else if ((res_vec.GetType().id() == LogicalTypeId::TIMESTAMP &&
+			            output_vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ) ||
+			           (res_vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ &&
+			            output_vec.GetType().id() == LogicalTypeId::TIMESTAMP)) {
+				throw BinderException(
+				    "Refusing implicit session-timezone cast between TIMESTAMP and TIMESTAMP WITH TIME ZONE in Oracle "
+				    "scan");
+			} else {
+				VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
+			}
+
+			// throw an error in case of TryCast fails
+			if (!error.empty()) {
+				throw BinderException(error);
+			}
+		}
+		output.SetCardinality(res_chunk.size());
+
+		if (!gstate.local_filter_executor) {
+			return;
+		}
+		SelectionVector sel(output.size());
+		idx_t match_count = gstate.local_filter_executor->SelectExpression(output, sel);
+		if (match_count == 0) {
+			output.Reset();
+			output.SetCardinality(0);
+			continue;
+		}
+		if (match_count < output.size()) {
+			output.Slice(sel, match_count);
+			output.SetCardinality(match_count);
+		}
 		return;
 	}
-
-	// 没有列的结果集，设置输出为空
-	if (res_chunk.ColumnCount() == 0) {
-		output.SetCardinality(0);
-		return;
-	}
-
-	// 检查列数匹配
-	if (output.ColumnCount() != res_chunk.ColumnCount()) {
-		throw InternalException("ODBCScan: column count mismatch. Output has %lu columns, result has %lu columns",
-		                        output.ColumnCount(), res_chunk.ColumnCount());
-	}
-
-	string error;
-	for (idx_t c = 0; c < output.ColumnCount(); c++) {
-		Vector &output_vec = output.data[c];
-		Vector &res_vec = res_chunk.data[c];
-		error.clear();
-
-		// 检查向量有效性
-		if (output_vec.GetType().id() == LogicalTypeId::INVALID) {
-			throw InternalException("ODBCScan: output vector %lu has invalid type", c);
-		}
-		if (res_vec.GetType().id() == LogicalTypeId::INVALID) {
-			throw InternalException("ODBCScan: result vector %lu has invalid type", c);
-		}
-
-		if (res_vec.GetType() == output_vec.GetType()) {
-			// A same-type TryCast is DuckDB's NopCast and only references the
-			// source vector. Materialized ODBC chunks are owned by the function
-			// state, so the output must receive an independent copy.
-			VectorOperations::Copy(res_vec, output_vec, res_chunk.size(), 0, 0);
-		} else if (res_vec.GetType().id() == LogicalTypeId::VARCHAR &&
-		           output_vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ) {
-			TryCastDateTimeOffsetVector(res_vec, output_vec, res_chunk.size(), error);
-		} else {
-			VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
-		}
-
-		// throw an error in case of TryCast fails
-		if (!error.empty()) {
-			throw BinderException(error);
-		}
-	}
-	output.SetCardinality(res_chunk.size());
 }
 
 static InsertionOrderPreservingMap<string> ODBCScanToString(TableFunctionToStringInput &input) {

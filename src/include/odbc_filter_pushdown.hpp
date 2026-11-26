@@ -14,15 +14,24 @@
 
 namespace duckdb {
 
+struct ODBCFilterPushdownResult {
+	string where_clause;
+	vector<idx_t> unpushed_filter_columns;
+};
+
 class ODBCFilterPushdown {
 public:
 	static string TransformFilters(const vector<column_t> &column_ids, optional_ptr<TableFilterSet> filters,
 	                               const vector<string> &names);
+	static ODBCFilterPushdownResult TransformFiltersWithFallback(const vector<column_t> &column_ids,
+	                                                             optional_ptr<TableFilterSet> filters,
+	                                                             const vector<string> &names);
 
 private:
-	static string TransformFilter(string &column_name, TableFilter &filter);
+	static bool TryTransformFilter(const string &column_name, TableFilter &filter, string &out);
 	static string TransformComparison(ExpressionType type);
-	static string CreateExpression(string &column_name, vector<unique_ptr<TableFilter>> &filters, string op);
+	static bool TryCreateExpression(const string &column_name, vector<unique_ptr<TableFilter>> &filters,
+	                                const string &op, string &out);
 };
 
 } // namespace duckdb

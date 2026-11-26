@@ -1003,6 +1003,10 @@ static void Scan(ClientContext &ctx, TableFunctionInput &in, DataChunk &out) {
 			Reject();
 		s.Exec("ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,'");
 		s.Exec("ALTER SESSION SET NLS_CALENDAR='GREGORIAN'");
+		s.Exec("ALTER SESSION SET TIME_ZONE='+00:00'");
+		s.Exec("ALTER SESSION SET NLS_TIMESTAMP_TZ_FORMAT='SYYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM'");
+		s.Exec("ALTER SESSION SET NLS_TIMESTAMP_FORMAT='SYYYY-MM-DD HH24:MI:SS.FF6'");
+		s.Exec("ALTER SESSION SET NLS_DATE_FORMAT='SYYYY-MM-DD HH24:MI:SS'");
 		stage = "source_lock";
 		s.Exec("LOCK TABLE " + Identifier(d.schema) + "." + Identifier(d.table) + " IN EXCLUSIVE MODE WAIT 5");
 

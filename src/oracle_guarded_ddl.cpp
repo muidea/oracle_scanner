@@ -1205,6 +1205,7 @@ static void DDLExecScan(ClientContext &ctx, TableFunctionInput &in, DataChunk &o
 
 		// Fail-fast on active lock contention instead of waiting on table locks.
 		s.Exec("ALTER SESSION SET DDL_LOCK_TIMEOUT = 0");
+		s.Exec("ALTER SESSION SET TIME_ZONE='+00:00' NLS_CALENDAR='GREGORIAN'");
 
 		stage = "source_definition";
 		s.current_stage = "source_definition";

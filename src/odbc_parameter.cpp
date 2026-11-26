@@ -1,7 +1,9 @@
 #include "odbc_parameter.hpp"
 #include "odbc_types.hpp"
 #include "oracle_odbc_unicode.hpp"
+#include "oracle_temporal_utils.hpp"
 
+#include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/types/datetime.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -19,51 +21,48 @@ static void FillDateBuffer(Value &value, vector<char> &bind_buffer) {
 	SQL_DATE_STRUCT date;
 	std::memset(&date, '\0', sizeof(SQL_DATE_STRUCT));
 	date_t dd = DateValue::Get(value);
+	if (!Date::IsFinite(dd)) {
+		throw ConversionException("Oracle DATE parameter must be finite: %s", value.ToString());
+	}
 	int32_t year, month, day;
 	Date::Convert(dd, year, month, day);
+	if (!IsDuckDBYearInOracleRange(year)) {
+		throw ConversionException("Oracle DATE parameter out of supported range (-4712..9999): %s", value.ToString());
+	}
 
-	date.year = static_cast<SQLSMALLINT>(std::abs(year));
-	date.month = static_cast<SQLUSMALLINT>(std::abs(month));
-	date.day = static_cast<SQLUSMALLINT>(std::abs(day));
+	date.year = static_cast<SQLSMALLINT>(DuckDBYearToOracleYear(year));
+	date.month = static_cast<SQLUSMALLINT>(month);
+	date.day = static_cast<SQLUSMALLINT>(day);
 
 	bind_buffer.resize(sizeof(SQL_DATE_STRUCT));
 	std::memcpy(bind_buffer.data(), &date, sizeof(SQL_DATE_STRUCT));
 }
 
-static void FillTimeBuffer(Value &value, vector<char> &bind_buffer) {
-	SQL_TIME_STRUCT time;
-	std::memset(&time, '\0', sizeof(SQL_TIME_STRUCT));
-	dtime_t dt = TimeValue::Get(value);
-	int32_t hour, minute, second, micros;
-	Time::Convert(dt, hour, minute, second, micros);
-
-	time.hour = static_cast<SQLUSMALLINT>(std::abs(hour));
-	time.minute = static_cast<SQLUSMALLINT>(std::abs(minute));
-	time.second = static_cast<SQLUSMALLINT>(std::abs(second));
-
-	bind_buffer.resize(sizeof(SQL_TIME_STRUCT));
-	std::memcpy(bind_buffer.data(), &time, sizeof(SQL_TIME_STRUCT));
-}
-
-static void FillTimestampBuffer(Value &value, vector<char> &bind_buffer) {
+static void FillTimestampBuffer(timestamp_t ts, const Value &orig_value, vector<char> &bind_buffer) {
 	SQL_TIMESTAMP_STRUCT timestamp;
 	std::memset(&timestamp, '\0', sizeof(SQL_TIMESTAMP_STRUCT));
-	timestamp_t ts = TimestampValue::Get(value);
+	if (!Timestamp::IsFinite(ts)) {
+		throw ConversionException("Oracle TIMESTAMP parameter must be finite: %s", orig_value.ToString());
+	}
 	date_t dd;
 	dtime_t dt;
 	Timestamp::Convert(ts, dd, dt);
 	int32_t year, month, day;
 	Date::Convert(dd, year, month, day);
+	if (!IsDuckDBYearInOracleRange(year)) {
+		throw ConversionException("Oracle TIMESTAMP parameter out of supported range (-4712..9999): %s",
+		                          orig_value.ToString());
+	}
 	int32_t hour, minute, second, micros;
 	Time::Convert(dt, hour, minute, second, micros);
 
-	timestamp.year = static_cast<SQLSMALLINT>(std::abs(year));
-	timestamp.month = static_cast<SQLUSMALLINT>(std::abs(month));
-	timestamp.day = static_cast<SQLUSMALLINT>(std::abs(day));
-	timestamp.hour = static_cast<SQLUSMALLINT>(std::abs(hour));
-	timestamp.minute = static_cast<SQLUSMALLINT>(std::abs(minute));
-	timestamp.second = static_cast<SQLUSMALLINT>(std::abs(second));
-	timestamp.fraction = static_cast<SQLUINTEGER>(std::abs(micros)) * 1000; // Convert to nanoseconds
+	timestamp.year = static_cast<SQLSMALLINT>(DuckDBYearToOracleYear(year));
+	timestamp.month = static_cast<SQLUSMALLINT>(month);
+	timestamp.day = static_cast<SQLUSMALLINT>(day);
+	timestamp.hour = static_cast<SQLUSMALLINT>(hour);
+	timestamp.minute = static_cast<SQLUSMALLINT>(minute);
+	timestamp.second = static_cast<SQLUSMALLINT>(second);
+	timestamp.fraction = static_cast<SQLUINTEGER>(micros) * 1000; // Convert to nanoseconds
 
 	bind_buffer.resize(sizeof(SQL_TIMESTAMP_STRUCT));
 	std::memcpy(bind_buffer.data(), &timestamp, sizeof(SQL_TIMESTAMP_STRUCT));
@@ -125,21 +124,40 @@ ODBCParameter::ODBCParameter(const string &query, Value value_p) : value(std::mo
 		break;
 	case LogicalTypeId::DATE:
 		this->buffer_type = SQL_TYPE_DATE;
+		this->column_size = 10;
+		this->decimal_digits = 0;
 		FillDateBuffer(value, bind_buffer);
 		break;
-	case LogicalTypeId::TIME:
-		this->buffer_type = SQL_TYPE_TIME;
-		FillTimeBuffer(value, bind_buffer);
+	case LogicalTypeId::TIME: {
+		dtime_t dt = TimeValue::Get(value);
+		int32_t hour, minute, second, micros;
+		Time::Convert(dt, hour, minute, second, micros);
+		if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 || micros < 0 ||
+		    micros > 999999) {
+			throw ConversionException("Oracle TIME parameter out of range (00:00:00..23:59:59.999999): %s",
+			                          value.ToString());
+		}
+		this->buffer_type = SQL_VARCHAR;
+		this->use_text_buffer = true;
+		this->text_buffer = FormatOracleTimeISO(hour, minute, second, micros);
 		break;
+	}
 	case LogicalTypeId::TIMESTAMP:
 		this->buffer_type = SQL_TYPE_TIMESTAMP;
-		FillTimestampBuffer(value, bind_buffer);
+		this->column_size = 26;
+		this->decimal_digits = 6;
+		FillTimestampBuffer(TimestampValue::Get(value), value, bind_buffer);
 		break;
-	case LogicalTypeId::TIMESTAMP_TZ:
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		// Under pinned SESSIONTIMEZONE='+00:00', binding the UTC instant as SQL_TYPE_TIMESTAMP with
+		// DecimalDigits=6 works for both Oracle TSTZ and TSLTZ parameters without losing microseconds.
 		this->buffer_type = SQL_TYPE_TIMESTAMP;
-		value = value.DefaultCastAs(LogicalType::TIMESTAMP);
-		FillTimestampBuffer(value, bind_buffer);
+		this->column_size = 26;
+		this->decimal_digits = 6;
+		timestamp_t ts(value.GetValueUnsafe<int64_t>());
+		FillTimestampBuffer(ts, value, bind_buffer);
 		break;
+	}
 	case LogicalTypeId::DECIMAL:
 	case LogicalTypeId::HUGEINT:
 	case LogicalTypeId::VARCHAR:
@@ -167,14 +185,21 @@ SQLRETURN ODBCParameter::BindParameter(SQLHSTMT stmt, SQLUSMALLINT param_idx) {
 	case SQL_BIGINT:
 	case SQL_REAL:
 	case SQL_DOUBLE:
+		bind_length = NumericCast<SQLLEN>(bind_buffer.size());
+		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, ODBCTypes::GetCType(buffer_type), buffer_type,
+		                        bind_buffer.size(), 0, bind_buffer.data(), bind_buffer.size(), &bind_length);
 	case SQL_TYPE_DATE:
 	case SQL_TYPE_TIME:
 	case SQL_TYPE_TIMESTAMP:
+		bind_length = NumericCast<SQLLEN>(bind_buffer.size());
 		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, ODBCTypes::GetCType(buffer_type), buffer_type,
-		                        bind_buffer.size(), 0, bind_buffer.data(), bind_buffer.size(), &bind_length);
+		                        column_size > 0 ? column_size : bind_buffer.size(), decimal_digits, bind_buffer.data(),
+		                        bind_buffer.size(), &bind_length);
 	case SQL_VARCHAR: {
-		string str = value.ToString();
-		wide_bind_buffer = OracleODBCUTF8ToWide(str);
+		if (!use_text_buffer) {
+			text_buffer = value.ToString();
+		}
+		wide_bind_buffer = OracleODBCUTF8ToWide(text_buffer);
 		bind_length = (wide_bind_buffer.size() - 1) * sizeof(SQLWCHAR);
 		return SQLBindParameter(stmt, param_idx, SQL_PARAM_INPUT, SQL_C_WCHAR, SQL_WVARCHAR,
 		                        std::max<size_t>(1, wide_bind_buffer.size() - 1), 0, wide_bind_buffer.data(),

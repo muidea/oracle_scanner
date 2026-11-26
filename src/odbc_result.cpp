@@ -13,6 +13,7 @@
 #include "duckdb/function/cast/default_casts.hpp"
 #include <sql.h>
 #include <sqlext.h>
+#include <cctype>
 #include <cstdint>
 #include <string>
 #include <cstring>
@@ -174,28 +175,35 @@ static vector<ODBCField> ReadFields(const std::string &query, SQLHSTMT stmt, con
 		field.odbc_type = data_type;
 		field.c_type = ODBCTypes::GetCType(data_type);
 		auto lower_type_name = StringUtil::Lower(type_name);
-		if (ltype.id() == LogicalTypeId::TIMESTAMP) {
-			field.c_type = SQL_C_TYPE_TIMESTAMP;
-		} else if (ltype.id() == LogicalTypeId::VARCHAR && StringType::GetCollation(ltype) == "oracle_exact_numeric") {
+		if (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			// Preserve full fractional seconds and timezone offset text via SQL_C_CHAR.
 			field.c_type = SQL_C_CHAR;
-		} else if (ltype.id() == LogicalTypeId::VARCHAR) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::TIMESTAMP) {
+			field.c_type = SQL_C_TYPE_TIMESTAMP;
+		} else if (field.duckdb_type.id() == LogicalTypeId::VARCHAR &&
+		           StringType::GetCollation(field.duckdb_type) == "oracle_exact_numeric") {
+			field.c_type = SQL_C_CHAR;
+		} else if (field.duckdb_type.id() == LogicalTypeId::VARCHAR) {
 			// SQLGetData(SQL_C_CHAR) uses the Oracle client's ANSI conversion and
 			// replaces non-ASCII identifiers with '?'. Read text as UTF-16 and
 			// convert it to UTF-8 when writing the DuckDB vector.
 			field.c_type = SQL_C_WCHAR;
-		} else if (ltype.id() == LogicalTypeId::DECIMAL ||
-		           (ltype.id() == LogicalTypeId::DOUBLE && lower_type_name == "number")) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::DECIMAL ||
+		           (field.duckdb_type.id() == LogicalTypeId::DOUBLE && lower_type_name == "number")) {
 			field.c_type = SQL_C_CHAR;
-		} else if (ltype.id() == LogicalTypeId::FLOAT) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::FLOAT) {
 			field.c_type = SQL_C_FLOAT;
-		} else if (ltype.id() == LogicalTypeId::DOUBLE) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::DOUBLE) {
 			field.c_type = SQL_C_DOUBLE;
-		} else if (ltype.id() == LogicalTypeId::BLOB) {
+		} else if (field.duckdb_type.id() == LogicalTypeId::BLOB) {
 			field.c_type = SQL_C_BINARY;
 		}
 
 		// Resize buffer based on ODBC type
 		size_t buf_size = GetBufferSize(field.c_type, column_size);
+		if (field.c_type == SQL_C_CHAR && field.duckdb_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			buf_size = MaxValue<size_t>(buf_size, DEFAULT_BIND_BUFFER_SIZE);
+		}
 		field.bind_buffer.resize(buf_size);
 
 		fields.emplace_back(std::move(field));
@@ -870,6 +878,11 @@ static void WriteString(ODBCField &f, Vector &vec, idx_t row) {
 		return;
 	}
 
+	if (f.bind_length == 0) {
+		FlatVector::GetData<string_t>(vec)[row] = StringVector::AddStringOrBlob(vec, "", 0);
+		return;
+	}
+
 	if (f.ValueBufferSize() == 0) {
 		FlatVector::SetNull(vec, row, true);
 		return;
@@ -944,7 +957,50 @@ static void WriteNumber(ODBCField &f, Vector &vec, idx_t row) {
 	data[row] = num;
 }
 
+static string NormalizeTimestampTZText(string text) {
+	StringUtil::Trim(text);
+	auto date_time_sep = text.find_first_of(" T");
+	if (date_time_sep == string::npos) {
+		return text;
+	}
+	auto offset_pos = text.find_first_of("+-Zz", date_time_sep + 1);
+	if (offset_pos == string::npos) {
+		return text;
+	}
+	auto prefix = text.substr(0, offset_pos);
+	StringUtil::Trim(prefix);
+	auto suffix = text.substr(offset_pos);
+	StringUtil::Trim(suffix);
+	if (suffix == "z" || suffix == "Z") {
+		return prefix + "Z";
+	}
+	if ((suffix[0] == '+' || suffix[0] == '-') && suffix.size() >= 2 &&
+	    std::isdigit(static_cast<unsigned char>(suffix[1])) &&
+	    (suffix.size() == 2 || !std::isdigit(static_cast<unsigned char>(suffix[2])))) {
+		suffix.insert(1, 1, '0');
+	}
+	return prefix + suffix;
+}
+
 static void WriteDateTime(ODBCField &f, Vector &vec, idx_t row) {
+	if (vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ && f.c_type == SQL_C_CHAR) {
+		if (f.bind_length <= 0 || static_cast<size_t>(f.bind_length) > f.ValueBufferSize()) {
+			throw ConversionException("ODBC TIMESTAMP_TZ value has an invalid transfer length");
+		}
+		auto text_len = strnlen(f.ValueData(), static_cast<size_t>(f.bind_length));
+		string text(f.ValueData(), text_len);
+		auto normalized = NormalizeTimestampTZText(std::move(text));
+		timestamp_t ts_val;
+		bool has_offset = false;
+		string_t tz(nullptr, 0);
+		if (Timestamp::TryConvertTimestampTZ(normalized.c_str(), normalized.size(), ts_val, true, has_offset, tz) !=
+		        TimestampCastResult::SUCCESS ||
+		    !has_offset || tz.GetSize() != 0) {
+			throw ConversionException("Invalid ODBC TIMESTAMP WITH TIME ZONE value: \"%s\"", normalized);
+		}
+		FlatVector::GetData<timestamp_tz_t>(vec)[row] = timestamp_tz_t(ts_val.value);
+		return;
+	}
 
 	D_ASSERT(f.bind_buffer.size() >= sizeof(SQL_TIMESTAMP_STRUCT));
 	SQL_TIMESTAMP_STRUCT *ts = reinterpret_cast<SQL_TIMESTAMP_STRUCT *>(f.bind_buffer.data());

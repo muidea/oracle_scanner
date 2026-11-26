@@ -12,6 +12,7 @@
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -55,13 +56,29 @@ struct ODBCGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-static string NormalizeSQLServerDateTimeOffset(string input) {
-	StringUtil::Trim(input);
-	auto sign_pos = input.find_last_of("+-");
-	if (sign_pos != string::npos && sign_pos > 0 && input[sign_pos - 1] == ' ') {
-		input.erase(sign_pos - 1, 1);
+static string NormalizeTimestampTZText(string text) {
+	StringUtil::Trim(text);
+	auto date_time_sep = text.find_first_of(" T");
+	if (date_time_sep == string::npos) {
+		return text;
 	}
-	return input;
+	auto offset_pos = text.find_first_of("+-Zz", date_time_sep + 1);
+	if (offset_pos == string::npos) {
+		return text;
+	}
+	auto prefix = text.substr(0, offset_pos);
+	StringUtil::Trim(prefix);
+	auto suffix = text.substr(offset_pos);
+	StringUtil::Trim(suffix);
+	if (suffix == "z" || suffix == "Z") {
+		return prefix + "Z";
+	}
+	if ((suffix[0] == '+' || suffix[0] == '-') && suffix.size() >= 2 &&
+	    std::isdigit(static_cast<unsigned char>(suffix[1])) &&
+	    (suffix.size() == 2 || !std::isdigit(static_cast<unsigned char>(suffix[2])))) {
+		suffix.insert(1, 1, '0');
+	}
+	return prefix + suffix;
 }
 
 static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx_t count, string &error) {
@@ -77,10 +94,13 @@ static bool TryCastDateTimeOffsetVector(Vector &res_vec, Vector &output_vec, idx
 		}
 		auto s = src[r];
 		string raw(s.GetData(), s.GetSize());
-		string normalized = NormalizeSQLServerDateTimeOffset(raw);
+		string normalized = NormalizeTimestampTZText(raw);
 		timestamp_t parsed_ts;
-		if (Timestamp::TryConvertTimestamp(normalized.c_str(), normalized.size(), parsed_ts, true) !=
-		    TimestampCastResult::SUCCESS) {
+		bool has_offset = false;
+		string_t tz(nullptr, 0);
+		if (Timestamp::TryConvertTimestampTZ(normalized.c_str(), normalized.size(), parsed_ts, true, has_offset, tz) !=
+		        TimestampCastResult::SUCCESS ||
+		    !has_offset || tz.GetSize() != 0) {
 			error = StringUtil::Format("invalid timestamp field format: \"%s\"", raw);
 			return false;
 		}
@@ -109,14 +129,21 @@ static unique_ptr<GlobalTableFunctionState> ODBCInitGlobalState(ClientContext &c
 			select += "NULL";
 		} else {
 			auto column_id = input.column_ids[c];
+			auto &col = bind_data.table.GetColumn(LogicalIndex(column_id));
 			string col_name;
 			if (column_id < bind_data.remote_names.size()) {
 				col_name = bind_data.remote_names[column_id];
 			} else {
-				auto &col = bind_data.table.GetColumn(LogicalIndex(column_id));
 				col_name = col.GetName();
 			}
-			select += ODBCUtils::WriteIdentifier(col_name);
+			auto quoted = ODBCUtils::WriteIdentifier(col_name);
+			if (col.Type().id() == LogicalTypeId::TIMESTAMP_TZ) {
+				// Oracle ODBC describes TIMESTAMP WITH TIME ZONE as TIMESTAMP WITH LOCAL TIME ZONE
+				// and strips the offset via SESSIONTIMEZONE unless explicitly formatted with TZH:TZM.
+				select += "TO_CHAR(" + quoted + ", 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')";
+			} else {
+				select += quoted;
+			}
 		}
 	}
 	select += " FROM ";
@@ -201,14 +228,11 @@ static void ODBCScan(ClientContext &context, TableFunctionInput &data, DataChunk
 			// source vector. Materialized ODBC chunks are owned by the function
 			// state, so the output must receive an independent copy.
 			VectorOperations::Copy(res_vec, output_vec, res_chunk.size(), 0, 0);
+		} else if (res_vec.GetType().id() == LogicalTypeId::VARCHAR &&
+		           output_vec.GetType().id() == LogicalTypeId::TIMESTAMP_TZ) {
+			TryCastDateTimeOffsetVector(res_vec, output_vec, res_chunk.size(), error);
 		} else {
 			VectorOperations::TryCast(context, res_vec, output_vec, res_chunk.size(), &error);
-		}
-
-		if (!error.empty()) {
-			if (TryCastDateTimeOffsetVector(res_vec, output_vec, res_chunk.size(), error)) {
-				continue;
-			}
 		}
 
 		// throw an error in case of TryCast fails

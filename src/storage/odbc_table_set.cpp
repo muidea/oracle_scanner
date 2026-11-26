@@ -256,6 +256,46 @@ string GetTableInfoQuery(const string &schema_name, const string &table_name) {
 unique_ptr<ODBCTableInfo> ODBCTableSet::GetTableInfo(ClientContext &context, ODBCSchemaEntry &schema,
                                                      const string &table_name, bool is_view) {
 	auto &transaction = ODBCTransaction::Get(context, schema.ParentCatalog());
+	auto columns_query = StringUtil::Replace(
+	    StringUtil::Replace(R"(
+	SELECT
+	    COLUMN_NAME,
+	    DATA_TYPE,
+	    TO_CHAR(DATA_PRECISION),
+	    TO_CHAR(DATA_SCALE)
+	FROM ALL_TAB_COLUMNS
+	WHERE OWNER = ${SCHEMA_NAME}
+	  AND TABLE_NAME = ${TABLE_NAME}
+	ORDER BY COLUMN_ID
+	)",
+	                        "${SCHEMA_NAME}", ODBCUtils::WriteLiteral(schema.name)),
+	    "${TABLE_NAME}", ODBCUtils::WriteLiteral(table_name));
+	try {
+		auto columns = transaction.Query(columns_query);
+		auto table_info = make_uniq<ODBCTableInfo>(schema, table_name, is_view);
+		ODBCTypeConfig type_config(context);
+		while (columns->Next()) {
+			auto remote_column_name = columns->GetString(0);
+			auto column_name = NormalizeObjectName(remote_column_name);
+			if (column_name.empty()) {
+				continue;
+			}
+			ODBCTypeData type_info;
+			type_info.type_name = columns->GetString(1);
+			type_info.column_type = type_info.type_name;
+			type_info.precision = columns->IsNull(2) ? -1 : std::stoll(columns->GetString(2));
+			type_info.scale = columns->IsNull(3) ? -1 : std::stoll(columns->GetString(3));
+			ColumnDefinition column(std::move(column_name), ODBCTypes::TypeToLogicalType(type_config, type_info));
+			table_info->create_info->columns.AddColumn(std::move(column));
+			table_info->remote_column_names.push_back(std::move(remote_column_name));
+		}
+		if (!table_info->remote_column_names.empty()) {
+			return table_info;
+		}
+	} catch (...) {
+		// Fall back to probe query when ALL_TAB_COLUMNS is unavailable or empty (e.g. synonyms).
+	}
+
 	auto query = GetTableInfoQuery(schema.name, table_name);
 	auto result = transaction.Query(query);
 	auto table_info = make_uniq<ODBCTableInfo>(schema, table_name, is_view);

@@ -15,6 +15,9 @@
 #include <sqlext.h>
 
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 #include "storage/odbc_schema_entry.hpp"
 #include "storage/odbc_transaction.hpp"
@@ -514,7 +517,17 @@ string ODBCUtils::TransformConstant(const Value &val) {
 		return "TIMESTAMP " + WriteLiteral(val.DefaultCastAs(LogicalType::VARCHAR).GetValue<string>());
 	}
 	if (val.type().id() == LogicalTypeId::TIMESTAMP_TZ) {
-		return val.DefaultCastAs(LogicalType::TIMESTAMP).DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
+		auto ts = timestamp_t(val.GetValueUnsafe<int64_t>());
+		date_t dt;
+		dtime_t tm;
+		Timestamp::Convert(ts, dt, tm);
+		int32_t year, month, day, hour, minute, second, micros;
+		Date::Convert(dt, year, month, day);
+		Time::Convert(tm, hour, minute, second, micros);
+		char buf[64];
+		std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%06d +00:00", year, month, day, hour, minute,
+		              second, micros);
+		return "TO_TIMESTAMP_TZ(" + WriteLiteral(string(buf)) + ", 'YYYY-MM-DD HH24:MI:SS.FF6 TZH:TZM')";
 	}
 	return val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString();
 }
